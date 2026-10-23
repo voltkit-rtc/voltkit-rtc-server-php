@@ -1,0 +1,100 @@
+<?php
+
+// The handful of Laravel symbols examples/laravel uses, so PHPStan can analyse the example without
+// Laravel installed. Signatures follow illuminate/http 11.
+
+namespace Illuminate\Http;
+
+class Request
+{
+    /** @return string|resource|false */
+    public function getContent(bool $asResource = false) {}
+
+    /** @return string|array<int, string|null>|null */
+    public function header(?string $key = null, mixed $default = null) {}
+
+    public function input(?string $key = null, mixed $default = null): mixed {}
+
+    public function ip(): ?string {}
+
+    public function user(?string $guard = null): ?\Illuminate\Contracts\Auth\Authenticatable {}
+}
+
+class JsonResponse extends Response
+{
+    /** @param array<string, string> $headers */
+    public function __construct(mixed $data = null, int $status = 200, array $headers = [], int $options = 0) {}
+}
+
+class Response
+{
+    /** @param array<string, string> $headers */
+    public function __construct(mixed $content = '', int $status = 200, array $headers = []) {}
+}
+
+namespace Illuminate\Routing;
+
+class Controller
+{
+}
+
+class Route
+{
+    /** @param string|list<string> $middleware */
+    public function middleware(string|array $middleware): static {}
+}
+
+namespace Illuminate\Support\Facades;
+
+class Route
+{
+    public static function post(string $uri, mixed $action = null): \Illuminate\Routing\Route {}
+}
+
+class Log
+{
+    /** @param array<string, mixed> $context */
+    public static function info(string $message, array $context = []): void {}
+
+    /** @param array<string, mixed> $context */
+    public static function error(string $message, array $context = []): void {}
+
+    /** @param array<string, mixed> $context */
+    public static function warning(string $message, array $context = []): void {}
+}
+
+class Cache
+{
+    public static function add(string $key, mixed $value, int|\DateTimeInterface|\DateInterval|null $ttl = null): bool {}
+}
+
+namespace Illuminate\Support;
+
+class ServiceProvider
+{
+    /** @var \Illuminate\Contracts\Foundation\Application */
+    protected $app;
+
+    public function register(): void {}
+}
+
+namespace Illuminate\Contracts\Foundation;
+
+interface Application
+{
+    public function singleton(string $abstract, \Closure|string|null $concrete = null): void;
+}
+
+namespace Illuminate\Contracts\Config;
+
+interface Repository
+{
+    public function get(string $key, mixed $default = null): mixed;
+}
+
+namespace Illuminate\Contracts\Auth;
+
+interface Authenticatable
+{
+    public function getAuthIdentifier(): mixed;
+}

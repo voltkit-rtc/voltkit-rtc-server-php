@@ -1,0 +1,90 @@
+{
+    "name": "voltkit/rtc-server",
+    "description": "VoltKit RTC server SDK for PHP: rooms, tokens, chat, broadcast streams, usage, billing and verified webhooks.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "voltkit",
+        "rtc",
+        "webrtc",
+        "live",
+        "streaming",
+        "video",
+        "audio",
+        "chat",
+        "webhooks"
+    ],
+    "homepage": "https://voltkit.in/rtc",
+    "support": {
+        "docs": "https://voltkit.in/docs/php-sdk",
+        "source": "https://github.com/voltkit-rtc/voltkit-rtc-server-php",
+        "issues": "https://github.com/voltkit-rtc/voltkit-rtc-server-php/issues",
+        "email": "contact@voltkit.in"
+    },
+    "require": {
+        "php": "^8.2",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "ext-mbstring": "*"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.1",
+        "phpunit/phpunit": "^11.5 || ^12.0 || ^13.0",
+        "psr/http-client": "^1.0",
+        "psr/http-factory": "^1.0",
+        "psr/http-message": "^1.1 || ^2.0",
+        "psr/log": "^1.1 || ^2.0 || ^3.0",
+        "squizlabs/php_codesniffer": "^3.13 || ^4.0"
+    },
+    "suggest": {
+        "psr/http-client": "To send requests through a PSR-18 client (Guzzle, Symfony HttpClient) with VoltKit\\Rtc\\Transport\\Psr18Transport",
+        "psr/http-factory": "Needed with psr/http-client: Psr18Transport builds its PSR-7 requests with a request and a stream factory",
+        "psr/log": "To pass a PSR-3 logger that receives method, path, status, attempt and elapsed time per request (never headers, bodies or keys)"
+    },
+    "autoload": {
+        "psr-4": {
+            "VoltKit\\Rtc\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "VoltKit\\Rtc\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "lint": "phpcs",
+        "analyse": "phpstan analyse",
+        "check": [
+            "@lint",
+            "@analyse",
+            "@test"
+        ]
+    },
+    "scripts-descriptions": {
+        "test": "Run the PHPUnit suite (unit, shared vectors, real transport on a loopback server)",
+        "lint": "Check PSR-12 with PHP_CodeSniffer",
+        "analyse": "Run PHPStan at the maximum level",
+        "check": "Lint, analyse and test"
+    },
+    "config": {
+        "sort-packages": true,
+        "optimize-autoloader": true
+    },
+    "archive": {
+        "exclude": [
+            "/tests",
+            "/phpstan-stubs",
+            "/phpunit.xml.dist",
+            "/phpstan.neon.dist",
+            "/phpcs.xml.dist",
+            "/.gitignore",
+            "/composer.lock",
+            "/vendor",
+            "/.phpunit.cache",
+            "/REVIEW-2026-10-23.md"
+        ]
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<ruleset name="voltkit-rtc-server">
+    <description>PSR-12, strict types everywhere.</description>
+    <file>src</file>
+    <file>tests</file>
+    <file>examples</file>
+    <arg name="extensions" value="php"/>
+    <arg name="colors"/>
+    <arg value="sp"/>
+    <rule ref="PSR12"/>
+    <rule ref="Generic.PHP.RequireStrictTypes"/>
+    <!-- A test fixture: a server script with its helpers in one file. -->
+    <rule ref="PSR1.Files.SideEffects">
+        <exclude-pattern>tests/Support/loopback-server.php</exclude-pattern>
+    </rule>
+    <!-- PSR-12's soft limit of 120, applied to code; a PHPDoc array shape or a cited message may run longer. -->
+    <rule ref="Generic.Files.LineLength">
+        <properties>
+            <property name="lineLimit" value="120"/>
+            <property name="absoluteLineLimit" value="0"/>
+            <property name="ignoreComments" value="true"/>
+        </properties>
+        <!-- Test fixtures quote long keys and long messages from the shared vectors. -->
+        <exclude-pattern>tests/*</exclude-pattern>
+    </rule>
+</ruleset>
