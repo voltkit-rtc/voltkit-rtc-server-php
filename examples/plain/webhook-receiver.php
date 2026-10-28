@@ -33,7 +33,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
     exit;
 }
 
-$rawBody = (string) file_get_contents('php://input');          // the bytes as received: the signature covers them
+// The bytes as received (the signature covers them), and never more than 1 MB: a delivery is a few KB.
+$rawBody = (string) file_get_contents('php://input', false, null, 0, 1_048_577);
+if (strlen($rawBody) > 1_048_576) {
+    http_response_code(413);
+    exit;
+}
 $header = $_SERVER['HTTP_X_STREAM_SIGNATURE'] ?? null;
 
 try {

@@ -238,6 +238,26 @@ final class MethodsTest extends TestCase
     }
 
     #[Test]
+    public function getRatesKeepsTheMusicAddonAndDecodesAListWithoutIt(): void
+    {
+        // The Music add-on (0.1.1): addons.music is kept whole, like a tier row.
+        $music = [
+            'id' => 'music', 'label' => 'Music add-on', 'price' => '10.00', 'cuPerParticipantSecond' => '1000',
+            'unit' => 'credits per 1,000 participant-minutes while music plays',
+            'appliesTo' => ['audio_std', 'audio_hd'],
+            'includedIn' => ['video_30', 'video_480_60', 'video_720_60', 'video_1080_60'],
+        ];
+        $rates = ['version' => 4, 'kind' => 'standard', 'tiers' => [], 'addons' => ['music' => $music]];
+        $t = new FakeTransport(['status' => 200, 'body' => ['success' => true, 'data' => $rates]]);
+        $got = $this->client($t, ratesBaseUrl: 'https://api.example.com')->getRates();
+        self::assertSame(['music' => $music], $got['addons'] ?? null);
+        // An exact cost while music plays, like a tier's: 4 people for 30 minutes.
+        self::assertSame(7200000, (int) $music['cuPerParticipantSecond'] * 4 * 30 * 60);
+        $older = new FakeTransport(['status' => 200, 'body' => ['success' => true, 'data' => ['version' => 3, 'kind' => 'standard']]]);
+        self::assertArrayNotHasKey('addons', $this->client($older, ratesBaseUrl: 'https://api.example.com')->getRates());
+    }
+
+    #[Test]
     public function getRatesOnAReplyWithoutTheEnvelopeFailsWithHttpStatusAndIsNotRetried(): void
     {
         foreach ([['status' => 'ok'], ['success' => true, 'data' => 'nope'], ['success' => true, 'data' => null], ['success' => true]] as $body) {

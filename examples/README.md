@@ -24,9 +24,11 @@ php -S 127.0.0.1:8899 -t examples/plain
   the session, never from the body; the `X-Demo-User` header stands in for the session here. The role is this
   backend's decision (a placeholder: the owner of the show is the host, everyone else a viewer). Errors are
   mapped by code: `no-room` is 404, the quota codes 402, anything retryable 503 with `Retry-After`, the rest
-  500 without details.
+  500 without details. A reply without a `token` or `wsUrl` is 502, never a 200 the client cannot connect
+  with, and a body over 1 MB is 413: the endpoint never reads more, with a `Content-Length` or chunked.
 - `POST http://127.0.0.1:8899/webhook-receiver.php` is the endpoint to put in the dashboard (through a
-  tunnel such as `ssh -R` or ngrok when testing from a laptop). It reads the raw body, verifies with
+  tunnel such as `ssh -R` or ngrok when testing from a laptop). It reads the raw body (at most 1 MB: a
+  larger one is 413), verifies with
   every secret in `VOLTKIT_RTC_WEBHOOK_SECRETS`, answers 401 when the signature does not verify, 200 at
   once otherwise, deduplicates on the event id, and only then does its work.
 
@@ -39,7 +41,9 @@ curl -s -X POST http://127.0.0.1:8899/token-server.php -H 'Content-Type: applica
 
 Without a VoltKit project there is nothing to mint tokens from, but both programs are exercised
 against a scratch controller by the repository's live smoke (`scripts/test/php-sdk-live.sh`): it serves
-this folder with `php -S` and checks every branch of both endpoints.
+this folder with `php -S` and checks every branch of both endpoints. `tests/Examples/PlainExamplesTest.php`
+serves it with `php -S` against the test suite's loopback controller: the 502 on an incomplete token and the
+1 MB limit on both endpoints.
 
 ## Laravel
 

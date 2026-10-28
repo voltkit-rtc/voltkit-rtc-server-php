@@ -121,7 +121,7 @@ final class VectorsTest extends TestCase
         self::assertSame($c['ratesPath'], StreamClient::RATES_PATH);
         $wh = self::arr($c['webhookHeader'], 'webhookHeader');
         self::assertSame($wh['maxHeaderLength'], Webhooks::MAX_HEADER_LENGTH);
-        self::assertSame('0.4.8', $c['nodeSdkVersion'], 'the vectors were regenerated from another Node SDK: review the changes');
+        self::assertSame('0.4.9', $c['nodeSdkVersion'], 'the vectors were regenerated from another Node SDK: review the changes');
     }
 
     #[Test]

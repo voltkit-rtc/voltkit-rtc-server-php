@@ -26,6 +26,16 @@
  *   /html           200 text/html, not JSON
  *   /slow           headers, half a body, 60 ms, the rest
  *   /status/<n>     that status, {"error":"from-the-server","message":"m"}
+ *   /token          200 a complete room token
+ *   /token-empty    200 a room token whose token and wsUrl are empty strings
+ *   /token-no-ws    200 a room token without a wsUrl (its token must never be logged)
+ *   /big/<n>        200 a valid rooms reply of exactly <n> bytes, its length declared
+ *   /big-stream/<n> the same with no Content-Length (read to the close), written in 64 KiB pieces; how
+ *                   many bytes went out before the client left is logged as one more line,
+ *                   {"method":"WRITTEN","path":<the path>,"body":"<bytes>"}
+ *   /declared-huge  200 declaring a 1,000,000,000-byte body, its first bytes, then nothing until the client leaves
+ *   /redirect-huge  302 to /landed<path> declaring a 1,000,000,000-byte body, then nothing until the client leaves
+ *   /rates-to-big/<n> 302 to /big/<n>
  */
 
 declare(strict_types=1);
@@ -70,6 +80,14 @@ function reply($client, int $status, array $headers, string $body, bool $announc
 function json(mixed $value): string
 {
     return json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+}
+
+/** A valid rooms reply of exactly $bytes bytes: one room, then a padding field a client passes through. */
+function paddedRooms(int $bytes): string
+{
+    $head = '{"rooms":[{"roomId":"r"}],"pad":"';
+    $tail = '"}';
+    return $head . str_repeat('m', max(0, $bytes - strlen($head) - strlen($tail))) . $tail;
 }
 
 /**
@@ -202,9 +220,55 @@ for (;;) {
             fwrite($client, '[]}');
             fflush($client);
             break;
+        case 'token':
+        case 'token-empty':
+        case 'token-no-ws':
+            $token = ['token' => 'tok', 'wsUrl' => 'wss://x.test/ws', 'role' => 'viewer', 'identity' => 'user-7', 'roomId' => 'show-42', 'expiresAt' => 1787000600];
+            if ($scenario === 'token-empty') {
+                $token = ['token' => '', 'wsUrl' => ''] + $token;
+            } elseif ($scenario === 'token-no-ws') {
+                $token = ['token' => 'tok_never_logged'] + $token;
+                unset($token['wsUrl']);
+            }
+            reply($client, 200, $json, json($token));
+            break;
         case 'status':
             $status = (int) ($segments[1] ?? '500');
             reply($client, $status, $json, '{"error":"from-the-server","message":"m"}');
+            break;
+        case 'big':
+            reply($client, 200, $json, paddedRooms((int) ($segments[1] ?? '0')));
+            break;
+        case 'big-stream':
+            $big = paddedRooms((int) ($segments[1] ?? '0'));
+            fwrite($client, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
+            $written = 0;
+            for ($off = 0; $off < strlen($big); $off += 65536) {
+                $n = @fwrite($client, substr($big, $off, 65536));
+                if ($n === false || $n === 0) {
+                    break;
+                }
+                $written += $n;
+                fflush($client);
+            }
+            file_put_contents(
+                $logFile,
+                json(['method' => 'WRITTEN', 'path' => $target, 'headers' => [], 'body' => (string) $written]) . "\n",
+                FILE_APPEND | LOCK_EX,
+            );
+            break;
+        case 'declared-huge':
+            fwrite($client, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000000000\r\nConnection: close\r\n\r\n{\"rooms\":");
+            fflush($client);
+            waitForClientToLeave($client, 3.0);
+            break;
+        case 'redirect-huge':
+            fwrite($client, "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:$port/landed$restOfPath\r\nContent-Length: 1000000000\r\nConnection: close\r\n\r\n");
+            fflush($client);
+            waitForClientToLeave($client, 3.0);
+            break;
+        case 'rates-to-big':
+            reply($client, 302, ['Location' => "http://127.0.0.1:$port/big$restOfPath"], '');
             break;
         default:
             reply($client, 200, $json, '{"ok":true}');

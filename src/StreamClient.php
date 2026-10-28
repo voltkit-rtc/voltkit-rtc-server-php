@@ -45,12 +45,13 @@ use VoltKit\Rtc\Transport\TransportInterface;
  * @phpstan-type LegacyFunds array{unlimited: bool, freeSeconds: int, ownSeconds: int, sharedSeconds: int, totalSeconds: int, ...}
  * @phpstan-type WalletFunds array{spendOrder: list<string>, scopes: array<string, array{paidCu: string, promoCu: string, ...}>, paidCu: string, promoCu: string, availableCu: string, availableCredits: string, ...}
  * @phpstan-type ProjectBalance array{tenantId: string, billingMode: string, canJoin: bool, blocked: ?string, legacy: LegacyFunds, wallet: ?WalletFunds, burn: array{liveParticipants: int, projectCuPerSecond: string, walletCuPerSecond: string, ...}, remainingSeconds: int, walletLow: array{active: bool, graceSeconds: int, ...}, pricingVersion: ?int, updatedAt: int, ...}
- * @phpstan-type RtcRates array{version: int, kind: string, effectiveAt: ?string, unit: array{price: string, rate: string, cuPerCredit: string, ...}, tiers: list<array<string, mixed>>, surcharges: list<array<string, mixed>>, idleTier: string, modes: list<array<string, mixed>>, conversion: array<string, mixed>, notes: list<string>, ...}
+ * @phpstan-type RtcAddonRate array{price: string, unit: string, appliesTo: list<string>, includedIn: list<string>, id?: string, label?: string, cuPerParticipantSecond?: string, ...}
+ * @phpstan-type RtcRates array{version: int, kind: string, effectiveAt: ?string, unit: array{price: string, rate: string, cuPerCredit: string, ...}, tiers: list<array<string, mixed>>, surcharges: list<array<string, mixed>>, addons?: array{music?: RtcAddonRate, ...}, idleTier: string, modes: list<array<string, mixed>>, conversion: array<string, mixed>, notes: list<string>, ...}
  */
 final class StreamClient implements \JsonSerializable, \Stringable
 {
     /** The package version; also the version in the User-Agent. Bump with CHANGELOG.md. */
-    public const VERSION = '0.1.0';
+    public const VERSION = '0.1.1';
     /** Sent on every request, to the controller and to the rates host: nothing more identifying (spec 8). */
     public const USER_AGENT = 'voltkit-rtc-php/' . self::VERSION;
 
@@ -64,6 +65,27 @@ final class StreamClient implements \JsonSerializable, \Stringable
     public const BACKOFF_BASE_MS = 200;
     public const BACKOFF_FACTOR = 2;
     public const BACKOFF_JITTER_MAX_MS = 100;
+
+    /**
+     * The most of a reply body the SDK reads, 4 MiB, on a 2xx and on an error status alike (0.1.1). A reply past it
+     * fails with http-<status>, retryable by the status rule, and a message that quotes nothing of it; the curl
+     * transport stops reading at the cap, and one declared longer is not read at all. The largest honest reply (a
+     * room of thousands of participants, every live room of a project) is well under it. PHP has a memory_limit (128
+     * MB by default) that json_decode exhausts with a fatal error no catch can handle: a 10 MB reply of small values
+     * needed over 128 MB (SDK red team, 2026-10-28). Go reads up to 8 MiB; a Go program has no such limit.
+     */
+    public const MAX_REPLY_BYTES = 4 * 1024 * 1024;
+    /**
+     * The most objects and arrays a reply under MAX_REPLY_BYTES may hold (each `{` and `[` in the text counts), or it
+     * is refused as too large before json_decode builds anything (0.1.1). json_decode makes a PHP array of 200 to 450
+     * bytes of each, so a 4 MiB reply of `[0],[0],...` would need about 240 MB, where values alone cost at most about
+     * 12 bytes per byte of reply (50 MB at the cap). At 100,000 the worst reply under both limits takes about 85 MB;
+     * an honest reply at the byte cap holds at most about 80,000 (a room is two or three, a participant one).
+     */
+    public const MAX_REPLY_CONTAINERS = 100_000;
+    /** What a reply past either limit fails with, after "<METHOD> <path>: the reply is too large: ". */
+    private const TOO_LARGE_BYTES = 'over ' . (self::MAX_REPLY_BYTES >> 20) . ' MiB, the most this SDK reads';
+    private const TOO_LARGE_CONTAINERS = 'over 100,000 objects and arrays, the most this SDK decodes';
 
     /** Where a message is cut, after redaction: the text of an error reply that names no message, a 2xx that is not JSON, a redirect's target. */
     public const CUT_ERROR_REPLY = 300;
@@ -559,6 +581,12 @@ final class StreamClient implements \JsonSerializable, \Stringable
      * and on another host. Fails with `rates-unconfigured` (status 0) without $ratesBaseUrl, and with
      * `http-<status>` when the reply is not the website's { success, data } envelope.
      *
+     * `addons.music` (0.1.1) is the Music add-on: in-app music billed on standard and HD voice while music
+     * plays (`price` in credits per 1,000 participant-minutes, "0.00" when this price list does not charge for it;
+     * `cuPerParticipantSecond` the exact integer; `appliesTo`, `includedIn`), included with video; absent from a
+     * price list older than the add-on.
+     * `music` is an add-on id, not a tier: a usage line with `tier: "music"` is the add-on's minutes.
+     *
      * @return RtcRates the `data` of the envelope
      */
     public function getRates(): array
@@ -763,6 +791,18 @@ final class StreamClient implements \JsonSerializable, \Stringable
                     false,
                 );
             }
+            // Before anything is decoded, on any status: past the cap the reply is neither the API's nor worth
+            // decoding (a misbehaving server, a proxy), and decoding it could end this process. Nothing of it is
+            // quoted, so nothing in the message needs redacting; retryable as any reply that named no code.
+            $tooLarge = $response->tooLarge ? self::TOO_LARGE_BYTES : self::tooLarge($response->body);
+            if ($tooLarge !== null) {
+                throw new StreamError(
+                    "http-$status",
+                    $status,
+                    "$method $path: the reply is too large: $tooLarge",
+                    $status >= 500 || $status === 429,
+                );
+            }
             $decoded = $this->decodeReply($method, $path, $status, $response->body, $object);
             if ($decoded['error'] !== null) {
                 [$code, $message, $retryable] = $decoded['error'];
@@ -778,6 +818,27 @@ final class StreamClient implements \JsonSerializable, \Stringable
                 'elapsedMs' => (int) ((hrtime(true) - $started) / 1_000_000),
             ]);
         }
+    }
+
+    /**
+     * Why a reply is too large to decode (what the message says after "the reply is too large: "), or null. The
+     * objects and arrays are counted only in a reply that could be a JSON object or array: an HTML page full of
+     * braces is "not JSON", as before. A `{` or `[` inside a string counts too, so the count errs on the safe side.
+     * This returns rather than throws, so that the raw text is in no frame's arguments when the error is made.
+     */
+    private static function tooLarge(string $text): ?string
+    {
+        if (strlen($text) > self::MAX_REPLY_BYTES) {
+            return self::TOO_LARGE_BYTES;
+        }
+        $first = $text[strspn($text, " \t\r\n")] ?? '';
+        if (
+            ($first === '{' || $first === '[')
+            && substr_count($text, '{') + substr_count($text, '[') > self::MAX_REPLY_CONTAINERS
+        ) {
+            return self::TOO_LARGE_CONTAINERS;
+        }
+        return null;
     }
 
     /** What a network error says after "<METHOD> <path>: ": the timeout in ms, or the transport's words redacted. */

@@ -65,7 +65,13 @@ $userId = $currentUserId();
 if ($userId === null) {
     $answer(401, ['error' => 'Sign in first']);
 }
-$input = json_decode((string) file_get_contents('php://input'), true);
+// A token request is a few bytes: never read more than 1 MB and one byte, with a Content-Length or chunked.
+$maxBody = 1_048_576;
+$raw = (string) file_get_contents('php://input', false, null, 0, $maxBody + 1);
+if (strlen($raw) > $maxBody) {
+    $answer(413, ['error' => 'The request body is over 1 MB']);
+}
+$input = json_decode($raw, true);
 $roomId = is_array($input) && is_string($input['roomId'] ?? null) ? $input['roomId'] : '';
 if ($roomId === '') {
     $answer(400, ['error' => 'roomId is required']);
@@ -91,6 +97,11 @@ try {
         $answer(503, ['error' => 'Try again in a moment'], ['Retry-After' => '10']);
     }
     $answer(500, ['error' => 'Something went wrong']);   // unauthorized, bad-role, ...: a problem on this side
+}
+if (($token['token'] ?? '') === '' || ($token['wsUrl'] ?? '') === '') {
+    // A 200 without a usable token is no success. Logged by room, never the reply: it may hold a token.
+    error_log('createToken returned no token or wsUrl for room ' . json_encode($roomId, JSON_THROW_ON_ERROR));
+    $answer(502, ['error' => 'The RTC service returned an incomplete token; try again']);
 }
 
 $answer(200, [

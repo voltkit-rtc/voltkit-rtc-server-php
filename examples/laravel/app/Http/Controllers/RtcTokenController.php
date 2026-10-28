@@ -57,6 +57,11 @@ final class RtcTokenController extends Controller
             }
             return new JsonResponse(['error' => 'Something went wrong'], 500);   // unauthorized, bad-role, ...: a problem on this side
         }
+        if (($token['token'] ?? '') === '' || ($token['wsUrl'] ?? '') === '') {
+            // A 200 without a usable token is no success. Logged by room, never the reply: it may hold a token.
+            Log::error('createToken returned no token or wsUrl', ['roomId' => $roomId]);
+            return new JsonResponse(['error' => 'The RTC service returned an incomplete token; try again'], 502);
+        }
 
         return new JsonResponse([
             'token' => $token['token'],

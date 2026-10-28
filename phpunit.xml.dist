@@ -18,6 +18,9 @@
         <testsuite name="transport">
             <directory>tests/Transport</directory>
         </testsuite>
+        <testsuite name="examples">
+            <directory>tests/Examples</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>

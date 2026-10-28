@@ -301,4 +301,123 @@ final class CurlTransportTest extends TestCase
         usleep(50_000);
         self::assertSame([], self::server()->requests(), 'nothing reached the server');
     }
+
+    // --- the reply cap (0.1.1): read up to StreamClient::MAX_REPLY_BYTES and no further ---------------------------
+
+    private const TOO_LARGE = 'the reply is too large: over 4 MiB, the most this SDK reads';
+
+    /** How many bytes the big-stream scenario wrote before the client left, once the server has said so. */
+    private function bytesWritten(): int
+    {
+        for ($i = 0; $i < 250; $i++) {
+            foreach (self::server()->requests() as $line) {
+                if ($line['method'] === 'WRITTEN') {
+                    return (int) $line['body'];
+                }
+            }
+            usleep(20_000);
+        }
+        self::fail('the server never said what it wrote');
+    }
+
+    /** The requests the server received, without its own WRITTEN line. */
+    private function gets(): int
+    {
+        return count(array_filter(self::server()->requests(), static fn (array $r): bool => $r['method'] === 'GET'));
+    }
+
+    #[Test]
+    public function aStreamedReplyPastTheCapIsRefusedAndNotReadToItsEnd(): void
+    {
+        // Eight times the cap and no length declared: the transport has to stop reading on its own.
+        $total = 8 * StreamClient::MAX_REPLY_BYTES;
+        $c = $this->real('big-stream/' . $total, timeoutMs: 10000, retries: 2);
+        $started = hrtime(true);
+        $e = $this->failure(static fn () => $c->listRooms());
+        $elapsedMs = (hrtime(true) - $started) / 1e6;
+        self::assertSame('http-200', $e->getErrorCode());
+        self::assertSame(200, $e->getStatus());
+        self::assertFalse($e->isRetryable());
+        self::assertSame('GET /v1/rooms: ' . self::TOO_LARGE, $e->getMessage());
+        self::assertLessThan(5000, $elapsedMs);
+        self::assertLessThan($total, $this->bytesWritten(), 'the server wrote it all: the client read past the cap');
+        self::assertSame(1, $this->gets(), 'a 2xx past the cap is not retried');
+    }
+
+    #[Test]
+    public function aStreamedReplyAtTheCapIsReadWhole(): void
+    {
+        $rooms = $this->real('big-stream/' . StreamClient::MAX_REPLY_BYTES, timeoutMs: 10000)->listRooms();
+        self::assertSame([['roomId' => 'r']], $rooms['rooms']);
+        self::assertSame(StreamClient::MAX_REPLY_BYTES, $this->bytesWritten());
+    }
+
+    #[Test]
+    public function aDeclaredLengthAtTheCapIsReadAndOneByteMoreIsRefused(): void
+    {
+        $rooms = $this->real('big/' . StreamClient::MAX_REPLY_BYTES, timeoutMs: 10000)->listRooms();
+        self::assertSame([['roomId' => 'r']], $rooms['rooms']);
+        $c = $this->real('big/' . (StreamClient::MAX_REPLY_BYTES + 1), timeoutMs: 10000, retries: 2);
+        $e = $this->failure(static fn () => $c->listRooms());
+        self::assertSame(['http-200', 200, false], [$e->getErrorCode(), $e->getStatus(), $e->isRetryable()]);
+        self::assertSame('GET /v1/rooms: ' . self::TOO_LARGE, $e->getMessage());
+    }
+
+    #[Test]
+    public function aDeclaredLengthPastTheCapIsRefusedBeforeTheBodyIsRead(): void
+    {
+        // A gigabyte declared, a few bytes sent, then nothing: the client must not wait for the rest.
+        $c = $this->real('declared-huge', timeoutMs: 5000);
+        $started = hrtime(true);
+        $e = $this->failure(static fn () => $c->listRooms());
+        $elapsedMs = (hrtime(true) - $started) / 1e6;
+        self::assertSame(['http-200', 200, false], [$e->getErrorCode(), $e->getStatus(), $e->isRetryable()]);
+        self::assertSame('GET /v1/rooms: ' . self::TOO_LARGE, $e->getMessage());
+        self::assertLessThan(2000, $elapsedMs, "refused at the headers, took {$elapsedMs} ms");
+    }
+
+    #[Test]
+    public function aRedirectDeclaringAHugeBodyIsStillARedirectAnsweredAtOnce(): void
+    {
+        $c = $this->real('redirect-huge', timeoutMs: 5000, retries: 2);
+        $started = hrtime(true);
+        $e = $this->failure(static fn () => $c->getBalance());
+        $elapsedMs = (hrtime(true) - $started) / 1e6;
+        self::assertSame('redirected', $e->getErrorCode());
+        self::assertSame(302, $e->getStatus());
+        self::assertStringContainsString('/landed/v1/billing/balance', $e->getMessage());
+        self::assertLessThan(2000, $elapsedMs, "took {$elapsedMs} ms");
+        self::assertSame(1, $this->gets());
+    }
+
+    #[Test]
+    public function theRatesFollowARedirectAndTheReplyTheyLandOnIsCappedToo(): void
+    {
+        $c = $this->real('echo', timeoutMs: 10000, ratesScenario: 'rates-to-big/' . (StreamClient::MAX_REPLY_BYTES + 1));
+        $e = $this->failure(static fn () => $c->getRates());
+        self::assertSame(['http-200', 200, false], [$e->getErrorCode(), $e->getStatus(), $e->isRetryable()]);
+        self::assertSame('GET ' . StreamClient::RATES_PATH . ': ' . self::TOO_LARGE, $e->getMessage());
+        self::assertSame(2, $this->gets(), 'the redirect, then the reply it led to');
+    }
+
+    #[Test]
+    public function outputOptionsOfTheCallersCannotTakeTheBodyAwayFromTheCap(): void
+    {
+        $file = tmpfile();
+        self::assertIsResource($file);
+        $transport = new CurlTransport([
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_FILE => $file,
+            CURLOPT_WRITEFUNCTION => static fn (\CurlHandle $h, string $data): int => strlen($data),
+        ]);
+        $c = new StreamClient(self::server()->baseUrl('ok'), 'sk_test', retries: 0, transport: $transport);
+        self::assertSame(['ok' => true], $c->listRooms(), 'the body reaches the client');
+        $big = self::server()->baseUrl('big-stream/' . (2 * StreamClient::MAX_REPLY_BYTES));
+        $c = new StreamClient($big, 'sk_test', retries: 0, timeoutMs: 10000, transport: $transport);
+        $e = $this->failure(static fn () => $c->listRooms());
+        self::assertSame('GET /v1/rooms: ' . self::TOO_LARGE, $e->getMessage());
+        $stat = fstat($file);
+        self::assertIsArray($stat);
+        self::assertSame(0, $stat['size'], 'nothing went to the file');
+    }
 }

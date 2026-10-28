@@ -7,6 +7,7 @@ namespace VoltKit\Rtc\Tests\Unit;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use VoltKit\Rtc\StreamClient;
+use VoltKit\Rtc\Tests\Support\ChunkedStream;
 use VoltKit\Rtc\Tests\Support\FakePsr17;
 use VoltKit\Rtc\Tests\Support\FakePsr18Client;
 use VoltKit\Rtc\Tests\Support\FakeResponse;
@@ -99,5 +100,54 @@ final class Psr18TransportTest extends TestCase
         self::assertSame(200, $reply->status);
         self::assertSame('a, b', $reply->header('x-many'));
         self::assertSame('{"ok":true}', $reply->body);
+    }
+
+    // --- the reply cap (0.1.1): the body is read in chunks, up to StreamClient::MAX_REPLY_BYTES ----------------------
+
+    private const TOO_LARGE = 'GET /v1/rooms: the reply is too large: over 4 MiB, the most this SDK reads';
+
+    private static function over(ChunkedStream $body, int $retries = 0): StreamClient
+    {
+        $factory = new FakePsr17();
+        $client = new FakePsr18Client([(new FakeResponse(200, ['Content-Type' => 'application/json'], ''))->withBody($body)]);
+        return new StreamClient('https://x.test', 'sk_test', retries: $retries, transport: new Psr18Transport($client, $factory, $factory), sleeper: static function (int $ms): void {
+        });
+    }
+
+    #[Test]
+    public function aBodyWhoseSizeIsKnownToBePastTheCapIsNotReadAtAll(): void
+    {
+        $body = new ChunkedStream('{"rooms":[],"pad":"', 100 * 1024 * 1024, '"}', sizeKnown: true);
+        $e = $this->failure(static fn () => self::over($body, retries: 2)->listRooms());
+        self::assertSame(['http-200', 200, false, self::TOO_LARGE], [$e->getErrorCode(), $e->getStatus(), $e->isRetryable(), $e->getMessage()]);
+        self::assertSame(0, $body->bytesRead);
+    }
+
+    #[Test]
+    public function aBodyOfUnknownSizeIsReadUpToTheCapAndNoFurther(): void
+    {
+        $body = new ChunkedStream('{"rooms":[],"pad":"', 100 * 1024 * 1024, '"}');
+        $e = $this->failure(static fn () => self::over($body)->listRooms());
+        self::assertSame(self::TOO_LARGE, $e->getMessage());
+        self::assertSame(StreamClient::MAX_REPLY_BYTES + 1, $body->bytesRead, 'one byte past the cap tells the two apart');
+    }
+
+    #[Test]
+    public function aBodyAtTheCapIsReadWholeInChunks(): void
+    {
+        foreach ([true, false] as $sizeKnown) {
+            $body = new ChunkedStream('{"rooms":[{"roomId":"r"}],"pad":"', StreamClient::MAX_REPLY_BYTES, '"}', sizeKnown: $sizeKnown);
+            $rooms = self::over($body)->listRooms();
+            self::assertSame([['roomId' => 'r']], $rooms['rooms']);
+            self::assertSame(StreamClient::MAX_REPLY_BYTES, $body->bytesRead);
+        }
+    }
+
+    #[Test]
+    public function aBodyThatFailsMidReadIsARetryableNetworkError(): void
+    {
+        $body = new ChunkedStream('{"rooms":[],"pad":"', 1024 * 1024, '"}', failAfter: 65536);
+        $e = $this->failure(static fn () => self::over($body)->listRooms());
+        self::assertSame(['network', 0, true, 'GET /v1/rooms: Connection reset by peer'], [$e->getErrorCode(), $e->getStatus(), $e->isRetryable(), $e->getMessage()]);
     }
 }

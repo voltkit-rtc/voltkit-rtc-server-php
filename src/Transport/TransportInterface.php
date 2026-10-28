@@ -15,7 +15,10 @@ namespace VoltKit\Rtc\Transport;
  *    API key): hand the 3xx back as the Response;
  *  - throw TransportException for anything that stops a reply from being read in full (a
  *    refused connection, DNS, the deadline, a body that breaks off), with $timedOut set when
- *    the deadline passed; never throw for an HTTP status.
+ *    the deadline passed; never throw for an HTTP status;
+ *  - should stop reading a body past StreamClient::MAX_REPLY_BYTES (one declared longer
+ *    need not be read at all) and return the Response with $tooLarge set: the client fails
+ *    such a reply without decoding it, and refuses a longer body handed over whole too.
  */
 interface TransportInterface
 {

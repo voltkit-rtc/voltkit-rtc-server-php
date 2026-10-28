@@ -201,8 +201,18 @@ $rtc = new StreamClient(baseUrl: ..., apiKey: ..., ratesBaseUrl: 'https://api.vo
 $rates = $rtc->getRates();
 // ['version' => 3, 'kind' => 'standard', 'effectiveAt' => ..., 'unit' => [...],
 //  'tiers' => [['id' => 'video_30', 'credits' => '99.00', 'cuPerParticipantSecond' => '9900', ...], ...],
-//  'surcharges' => [...], 'idleTier' => 'audio_std', 'modes' => [...], 'conversion' => [...], 'notes' => [...]]
+//  'surcharges' => [...], 'addons' => ['music' => ['price' => '10.00', 'cuPerParticipantSecond' => '1000', 'unit' => ..., 'appliesTo' => [...], 'includedIn' => [...]]],
+//  'idleTier' => 'audio_std', 'modes' => [...], 'conversion' => [...], 'notes' => [...]]
 ```
+
+**The Music add-on (0.1.1).** `$rates['addons']['music']` prices in-app music (`publishMusic` in the
+client SDKs): Music is an add-on on standard and HD voice (₹10 per 1,000 participant-minutes while music
+plays, enabled in the project's Settings → Media and quality); included with video. `price` is in credits
+per 1,000 participant-minutes and `cuPerParticipantSecond` the same as an exact integer; `appliesTo` names
+the voice tiers it is billed on top of and `includedIn` the video tiers that include it. `addons` is
+optional: a price list from before the add-on has no such key, so read it with `?? null`. `music` is an
+add-on id, not a tier: a usage line with `tier: "music"` (the settlement feed, the console's usage, the
+invoice) is the add-on's participant-minutes next to the participant's own tier line.
 
 The public price list: each tier in credits per 1,000 participant-minutes, the media modes that
 are switched on, and the conversion for new recharges. Prices are set on the website, so this is
@@ -247,6 +257,18 @@ Named arguments are the readable way to call it; the positional order is the one
   (a backslash, an accented letter): each throws `\InvalidArgumentException`. A `timeoutMs` of 0 or
   below or negative `retries` throws `\RangeException`; a non-integer is refused by PHP's own type
   check. None of these messages quotes the key or the URL.
+- **Reply size.** A reply is read up to 4 MiB (`StreamClient::MAX_REPLY_BYTES`) and no further, on a
+  2xx and on an error status alike: the curl transport stops reading one byte past it, and does not
+  read a body whose `Content-Length` says more. A reply under that holding more than 100,000 objects
+  and arrays (`StreamClient::MAX_REPLY_CONTAINERS`, each `{` and `[` counted) is refused too, before
+  `json_decode` builds anything. Either fails with `http-<status>`, that status, `isRetryable()` true
+  only for a 5xx or 429, and the message `GET /v1/rooms: the reply is too large: over 4 MiB, the most
+  this SDK reads` (or `over 100,000 objects and arrays, the most this SDK decodes`); nothing of the
+  reply is quoted. Why: `json_decode` turns a small value into 16 bytes and an object or array into
+  200 to 450, so a 10 MB reply of small values needs more than PHP's default `memory_limit` of
+  128 MB, which ends the worker with a fatal error no `catch` can handle. The largest real reply (a
+  room of thousands of participants, every live room of a project) is well under both limits, and
+  the costliest reply they let through takes about 85 MB. The Go SDK's cap is 8 MiB.
 
 ### Your own transport
 
@@ -282,6 +304,13 @@ target, so build it with `max_redirects => 0` as above; and a **total timeout** 
 `print_r`, `var_dump` and `json_encode` of one show the key and any URL password as `[redacted]`;
 a dumper that reads properties (Laravel's `dd()`) shows them as they are, so never dump or log a
 `Request`.
+
+Both transports read at most 4 MiB of a body. The PSR-18 adapter reads the PSR-7 body in chunks and
+not at all when its size is known to be past the cap, but the client may already have buffered the
+whole reply (Guzzle and Symfony do by default): to stop a large reply in transit, use the client's
+own limit (Guzzle's `on_headers` or `progress` option, Symfony's `on_progress`). Your own transport
+should stop reading past `StreamClient::MAX_REPLY_BYTES` and return `new Response($status, $headers,
+'', tooLarge: true)`; one that hands a longer body over whole is refused by the client all the same.
 
 ### A logger
 
@@ -362,7 +391,7 @@ to repeat; `createRoom`, `createStream` and `sendMessage` are [sent once](#calls
 | `network` | 0 | yes | No reply: DNS, a refused or dropped connection, the timeout, a body that broke off. Try again later; if it persists, check your server's outbound network |
 | `rates-unconfigured` | 0 | no | `getRates()` without `ratesBaseUrl`. Pass the website API origin |
 | `redirected` | 3xx | no | `baseUrl` redirects. Fix it: see [Redirects are never followed](#redirects-are-never-followed) |
-| `http-<status>` | that status | 429 and 5xx | A reply that named no code: a proxy's error page, or a 2xx that is not JSON. Check `baseUrl` and anything between your server and VoltKit |
+| `http-<status>` | that status | 429 and 5xx | A reply that named no code: a proxy's error page, a 2xx that is not JSON, or a reply past the size limits ("the reply is too large", see [Configuration](#configuration)). Check `baseUrl` and anything between your server and VoltKit |
 | `RATE_LIMITED`, `NOT_FOUND`, ... | | per status | The website API's own codes, from `getRates()`, passed through |
 
 When an error reaches you with `isRetryable()` true, the SDK has already spent its retries. Try
@@ -649,6 +678,7 @@ behind a CDN.
 
 | Version | What changed |
 | --- | --- |
+| 0.1.1 | Prepared 2026-10-28, not published. The Music add-on in `getRates()`: `addons.music` (`price`, `cuPerParticipantSecond`, `unit`, `appliesTo`, `includedIn`, `id`, `label`; absent from an older price list); `music` is an add-on id, not a tier. A reply is read up to 4 MiB and 100,000 objects and arrays, past which it fails with `http-<status>` instead of exhausting `memory_limit` (a fatal error) in `json_decode`. The examples' 502 on an incomplete token reply and 1 MB body cap (`CHANGELOG.md`). No method changed |
 | 0.1.0 | First release, to the shared server SDK specification; the same behaviour as `@voltkit-rtc/server` 0.4.8, checked against its vectors, and reviewed adversarially before release (`CHANGELOG.md`) |
 
 The package follows semver. While 0.x, a minor bump may add API; nothing public is removed or
