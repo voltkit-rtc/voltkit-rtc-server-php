@@ -16,15 +16,16 @@ use VoltKit\Rtc\StreamClient;
  * factories for the request and its body. Needs psr/http-client and psr/http-factory, which
  * the package suggests rather than requires; this class is only loaded when you use it.
  *
- * Two things the adapter cannot do for you, because PSR-18 gives it no say (checked against
- * Guzzle 7 and Symfony HttpClient 7 on 2026-10-23):
- *  - redirects: the client must never follow one. The SDK refuses a 3xx that comes back, but a
- *    client that followed one has already sent X-API-Key to the host it named. Guzzle's
- *    sendRequest() never follows (its PSR-18 path forces `allow_redirects` off); Symfony's
- *    Psr18Client follows up to 20 by default, so build it with `max_redirects => 0`:
- *    `new Psr18Client(HttpClient::create(['max_redirects' => 0, 'timeout' => 10]))`. With
- *    redirects off, getRates() also gets a 3xx back and fails with `http-3xx` instead of
- *    following it;
+ * Redirects: a request carrying the key must never follow one. The SDK refuses a 3xx that comes
+ * back, but a client that followed one has already sent X-API-Key to the host it named, and PSR-18
+ * gives the adapter no say. Symfony's Psr18Client and HttplugClient follow up to 20 by default and
+ * keep every header but Authorization and Cookie across hosts (the testers' report of 2026-10-31:
+ * the key reached the other host), so for a request carrying the key this adapter sends through
+ * their withOptions(['max_redirects' => 0]) copy (Symfony 6.2 and later; 0.1.2), and the public
+ * rates through the client as given. Guzzle's sendRequest() never follows (its PSR-18 path forces
+ * `allow_redirects` off). Any other client must be built not to follow: check yours.
+ *
+ * One thing the adapter cannot do for you (checked against Guzzle 7 and Symfony HttpClient 7):
  *  - the deadline: PSR-18 has no per-request timeout, so Request::$timeoutMs is not passed on.
  *    Give the client a total timeout covering the whole reply (Guzzle: `timeout`, not only
  *    `connect_timeout`; Guzzle has none by default), ideally the same value as the StreamClient's
@@ -39,11 +40,35 @@ use VoltKit\Rtc\StreamClient;
  */
 final class Psr18Transport implements TransportInterface
 {
+    /** Symfony's PSR-18 clients, which follow redirects by default and can be told not to (withoutRedirects()). */
+    private const SYMFONY_CLIENTS = [
+        'Symfony\\Component\\HttpClient\\Psr18Client',
+        'Symfony\\Component\\HttpClient\\HttplugClient',
+    ];
+
+    /** The client for a request that carries the key: one that follows no redirect where the adapter can see to it. */
+    private readonly ClientInterface $keyClient;
+
     public function __construct(
         private readonly ClientInterface $client,
         private readonly RequestFactoryInterface $requestFactory,
         private readonly StreamFactoryInterface $streamFactory,
     ) {
+        $this->keyClient = self::withoutRedirects($client);
+    }
+
+    /**
+     * `$client` for requests that carry the key: for Symfony's PSR-18 clients a copy that follows no redirect, made
+     * by their withOptions() (Symfony 6.2 and later); any other client as it is.
+     */
+    private static function withoutRedirects(ClientInterface $client): ClientInterface
+    {
+        // By name: both classes are final, and Symfony is no dependency of this package.
+        if (in_array($client::class, self::SYMFONY_CLIENTS, true) && method_exists($client, 'withOptions')) {
+            $copy = $client->withOptions(['max_redirects' => 0]);
+            return $copy instanceof ClientInterface ? $copy : $client;
+        }
+        return $client;
     }
 
     public function send(#[\SensitiveParameter] Request $request): Response
@@ -56,13 +81,21 @@ final class Psr18Transport implements TransportInterface
             $psr = $psr->withBody($this->streamFactory->createStream($request->body));
         }
         try {
-            $reply = $this->client->sendRequest($psr);
+            // The public rates carry no credential and may follow a redirect, as the caller's client does.
+            $reply = ($request->followRedirects ? $this->client : $this->keyClient)->sendRequest($psr);
         } catch (ClientExceptionInterface $e) {
             throw new TransportException($e->getMessage(), false, $e);
         }
         $headers = [];
         foreach ($reply->getHeaders() as $name => $values) {
             $headers[(string) $name] = implode(', ', $values);
+        }
+        $status = $reply->getStatusCode();
+        if (!$request->followRedirects && $status >= 300 && $status < 400) {
+            // A redirect the key never follows is decided at its headers (spec 3.5): the body is not read, so a
+            // stalled or endless one cannot turn `redirected` into a retried `network` error.
+            $reply->getBody()->close();
+            return new Response($status, $headers, '');
         }
         $body = self::readUpToTheCap($reply->getBody());
         return $body === null

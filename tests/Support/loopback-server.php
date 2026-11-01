@@ -20,6 +20,7 @@
  *   /drop-once      the connection closed with no reply on the first hit, then
  *                   404 {"error":"no-room","message":"room not found"}
  *   /redirect       302 to /landed<path> on every method
+ *   /redirect-elsewhere 302 to /landed<path> on another host: localhost, not 127.0.0.1
  *   /landed         200 {"landed":true}
  *   /rates-redirect 302 to /rates<path>
  *   /rates          200 {"success":true,"data":{...}} (the website envelope)
@@ -36,6 +37,7 @@
  *   /declared-huge  200 declaring a 1,000,000,000-byte body, its first bytes, then nothing until the client leaves
  *   /redirect-huge  302 to /landed<path> declaring a 1,000,000,000-byte body, then nothing until the client leaves
  *   /rates-to-big/<n> 302 to /big/<n>
+ *   /redirect-stall 302 to /landed<path> declaring a 100-byte body, 9 bytes of it, then nothing until the client leaves
  */
 
 declare(strict_types=1);
@@ -172,7 +174,9 @@ for (;;) {
 
     switch ($scenario) {
         case 'echo':
-            reply($client, 200, $json, json(['method' => $method, 'path' => $target, 'headers' => $headers, 'body' => $body]));
+            // With what the typed calls the tests make need of a reply (spec 3.6): a room id, a room.
+            $echo = ['method' => $method, 'path' => $target, 'headers' => $headers, 'body' => $body];
+            reply($client, 200, $json, json($echo + ['roomId' => 'echo', 'room' => new stdClass()]));
             break;
         case 'stall':
             fwrite($client, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"rooms\":");
@@ -200,6 +204,9 @@ for (;;) {
             break;
         case 'redirect':
             reply($client, 302, ['Location' => "http://127.0.0.1:$port/landed$restOfPath"], '');
+            break;
+        case 'redirect-elsewhere':
+            reply($client, 302, ['Location' => "http://localhost:$port/landed$restOfPath"], '');
             break;
         case 'landed':
             reply($client, 200, $json, '{"landed":true}');
@@ -264,6 +271,11 @@ for (;;) {
             break;
         case 'redirect-huge':
             fwrite($client, "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:$port/landed$restOfPath\r\nContent-Length: 1000000000\r\nConnection: close\r\n\r\n");
+            fflush($client);
+            waitForClientToLeave($client, 3.0);
+            break;
+        case 'redirect-stall':
+            fwrite($client, "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:$port/landed$restOfPath\r\nContent-Length: 100\r\n\r\nMoved to ");
             fflush($client);
             waitForClientToLeave($client, 3.0);
             break;

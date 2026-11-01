@@ -96,11 +96,17 @@ try {
     if ($e->isRetryable()) {
         $answer(503, ['error' => 'Try again in a moment'], ['Retry-After' => '10']);
     }
+    if ($e->getStatus() >= 200 && $e->getStatus() < 300) {
+        // A 2xx that is no token (the SDK refuses one without a token, and one that is not JSON): something other
+        // than the RTC service answered, or it misbehaved.
+        $answer(502, ['error' => 'The RTC service returned an incomplete token; try again']);
+    }
     $answer(500, ['error' => 'Something went wrong']);   // unauthorized, bad-role, ...: a problem on this side
 }
-if (($token['token'] ?? '') === '' || ($token['wsUrl'] ?? '') === '') {
-    // A 200 without a usable token is no success. Logged by room, never the reply: it may hold a token.
-    error_log('createToken returned no token or wsUrl for room ' . json_encode($roomId, JSON_THROW_ON_ERROR));
+if (($token['wsUrl'] ?? '') === '') {
+    // The SDK checks the token; without a wsUrl there is still nothing to connect to. Logged by room, never the
+    // reply: it holds a token.
+    error_log('createToken returned no wsUrl for room ' . json_encode($roomId, JSON_THROW_ON_ERROR));
     $answer(502, ['error' => 'The RTC service returned an incomplete token; try again']);
 }
 

@@ -6,15 +6,22 @@ namespace VoltKit\Rtc\Tests\Support;
 
 use Psr\Http\Message\RequestFactoryInterface;
 use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseFactoryInterface;
+use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\StreamFactoryInterface;
 use Psr\Http\Message\StreamInterface;
 
-/** PSR-17 request and stream factories over the fakes. */
-final class FakePsr17 implements RequestFactoryInterface, StreamFactoryInterface
+/** PSR-17 request, response and stream factories over the fakes (a real PSR-18 client builds its replies with them). */
+final class FakePsr17 implements RequestFactoryInterface, ResponseFactoryInterface, StreamFactoryInterface
 {
     public function createRequest(string $method, $uri): RequestInterface
     {
         return new FakeRequest($method, (string) $uri);
+    }
+
+    public function createResponse(int $code = 200, string $reasonPhrase = ''): ResponseInterface
+    {
+        return new FakeResponse($code, [], '');
     }
 
     public function createStream(string $content = ''): StreamInterface

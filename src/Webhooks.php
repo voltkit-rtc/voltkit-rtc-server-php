@@ -14,9 +14,10 @@ namespace VoltKit\Rtc;
  * can never verify. The header comes from `$_SERVER['HTTP_X_STREAM_SIGNATURE']` or a PSR-7
  * `getHeaderLine('X-Stream-Signature')`.
  *
- * Mistakes in the setup are loud: no secret, a tolerance that is not a number of 0 or more, or
- * a body that is not a string fail with \InvalidArgumentException, \RangeException or PHP's own
- * \TypeError, never with a quiet false that would look like an attack.
+ * Mistakes in the setup are loud: no secret (an empty or whitespace-only one is none), a tolerance
+ * that is not a number of 0 or more, a clock that is not a finite number, or a body that is not a
+ * string fail with \InvalidArgumentException, \RangeException or PHP's own \TypeError, never with
+ * a quiet false that would look like an attack.
  */
 final class Webhooks
 {
@@ -35,10 +36,10 @@ final class Webhooks
      *
      * @param string $rawBody the request body, byte for byte as received
      * @param string|list<string>|null $header the X-Stream-Signature value; a list (as some frameworks hand headers over) is joined with commas; null when the header is missing
-     * @param string|list<string> $secrets the signing secret, or the current and the previous one during a rotation; every secret is tried against every signature, in constant time, with no early return
-     * @param array{toleranceSeconds?: int|float|null, now?: int|float|\Closure|null} $options toleranceSeconds: a number of 0 or more (default 300; 0 is allowed and strict; INF lifts the check); now: the clock, as unix seconds or a closure returning them, for tests
+     * @param string|list<string> $secrets the signing secret, or the current and the previous one during a rotation; every secret is tried against every signature, in constant time, with no early return; one that is empty or only whitespace is no secret and never verifies anything
+     * @param array{toleranceSeconds?: int|float|null, now?: int|float|\Closure|null} $options toleranceSeconds: a number of 0 or more (default 300; 0 accepts the current second; INF lifts the check); now: the clock, as unix seconds (a fraction is fine) or a closure returning them, for tests. Whole seconds are compared: |floor(now) - t| > toleranceSeconds is too old or too new
      * @throws \InvalidArgumentException when no secret is given, or an option is not what it must be
-     * @throws \RangeException when toleranceSeconds is negative or NaN
+     * @throws \RangeException when toleranceSeconds is negative or NaN, or now is NaN or infinite
      */
     public static function verify(
         string $rawBody,
@@ -54,6 +55,8 @@ final class Webhooks
             return false;
         }
         // Both directions, inclusive at the boundary: a timestamp 300 s old or 300 s ahead passes with the default.
+        // Whole seconds against whole seconds (X-2): a fractional now against the header's whole-second timestamp
+        // refused a same-second delivery at a tolerance of 0. Both are exact as floats: 15 digits at most.
         if (abs($now - (float) $parsed['ts']) > $tolerance) {
             return false;
         }
@@ -94,7 +97,9 @@ final class Webhooks
             throw new StreamError('bad-signature', 401, 'webhook signature did not verify', false);
         }
         $event = json_decode($rawBody, true, 512, JSON_THROW_ON_ERROR);
-        if (!is_array($event) || ($event !== [] && array_is_list($event))) {
+        // An object is told from a list by the JSON itself: decoded, {} and [] are the same empty array and {"0":1}
+        // is a list (PHP011-4). JSON that decoded is an object exactly when it starts with {, after JSON's whitespace.
+        if (!is_array($event) || ltrim($rawBody, " \t\n\r")[0] !== '{') {
             throw new \UnexpectedValueException('the webhook body verified but is not a JSON object');
         }
         /** @var array{id: string, type: string, tenantId: string, roomId?: string, createdAt: int, data?: array<string, mixed>, ...} $event */
@@ -155,7 +160,11 @@ final class Webhooks
     {
         $list = [];
         foreach (is_string($secrets) ? [$secrets] : $secrets as $secret) {
-            if (is_string($secret) && $secret !== '') {
+            // Only whitespace is no secret, exactly like an empty one (D5, X-4): HMAC would take " " as a key, and a
+            // delivery signed with it verified. Whitespace is what JavaScript's trim() takes: ASCII's, and in UTF-8
+            // the Unicode spaces, the line and paragraph separators and the byte order mark. A secret with
+            // whitespace around real text is the whole string.
+            if (is_string($secret) && preg_match('/\A[\t\n\x0B\f\r\p{Z}\x{FEFF}]*\z/u', $secret) !== 1) {
                 $list[] = $secret;
             }
         }
@@ -197,27 +206,32 @@ final class Webhooks
         return (float) $tolerance;
     }
 
-    /** @param array<string, mixed> $options */
+    /**
+     * The clock, in whole seconds (X-2: the header's timestamp is whole seconds).
+     *
+     * @param array<string, mixed> $options
+     */
     private static function now(array $options): float
     {
         $now = $options['now'] ?? null;
         if ($now === null) {
-            return microtime(true);
-        }
-        if (is_int($now) || is_float($now)) {
-            return (float) $now;
+            return floor(microtime(true));
         }
         // A closure, not a function name: is_callable() is true for any function's name, so ['now' => 'system']
         // once called system() (review 2026-10-23). An invokable object is passed as $clock(...).
-        if ($now instanceof \Closure) {
-            $value = $now();
-            if (is_int($value) || is_float($value)) {
-                return (float) $value;
-            }
+        $value = $now instanceof \Closure ? $now() : $now;
+        if (!is_int($value) && !is_float($value)) {
+            throw new \InvalidArgumentException(
+                'now must be a unix time in seconds (int or float) or a closure returning one, got '
+                . self::describe($value),
+            );
         }
-        throw new \InvalidArgumentException(
-            'now must be a unix time in seconds (int or float) or a closure returning one',
-        );
+        if (!is_finite((float) $value)) {
+            // NaN switched the age check off, every comparison with it being false, so a captured delivery verified
+            // forever (X-3, PHP011-3); an infinity is no time either.
+            throw new \RangeException('now must be a finite unix time in seconds, got ' . self::describe($value));
+        }
+        return floor((float) $value);
     }
 
     private static function describe(mixed $value): string

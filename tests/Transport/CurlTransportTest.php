@@ -12,6 +12,7 @@ use VoltKit\Rtc\Tests\Support\Loopback;
 use VoltKit\Rtc\Tests\Support\MakesClients;
 use VoltKit\Rtc\Transport\CurlTransport;
 use VoltKit\Rtc\Transport\Request;
+use VoltKit\Rtc\Transport\TransportException;
 
 /**
  * The real curl transport against a loopback server (spec 11, item 3): the deadline covering a
@@ -251,7 +252,7 @@ final class CurlTransportTest extends TestCase
     #[Test]
     public function aRefusedConnectionIsANetworkErrorThatQuotesNoCredential(): void
     {
-        foreach (['http://admin:hunter2pw@127.0.0.1:9', 'http://admin:hunter2@pw@127.0.0.1:9'] as $baseUrl) {
+        foreach (['http://admin:hunter2pw@127.0.0.1:9', 'http://admin:hunter2%40pw@127.0.0.1:9'] as $baseUrl) {
             $c = new StreamClient($baseUrl, 'sk_test', retries: 0, timeoutMs: 2000);
             $e = $this->failure(static fn () => $c->listRooms());
             self::assertSame('network', $e->getErrorCode());
@@ -259,6 +260,13 @@ final class CurlTransportTest extends TestCase
             self::assertTrue($e->isRetryable());
             self::assertStringNotContainsString('hunter2', $e->getMessage());
             self::assertStringStartsWith('GET /v1/rooms: cURL error ', $e->getMessage());
+        }
+        // A raw @ in the password, which curl reads as a host it refuses, is refused when the client is made (0.1.2).
+        try {
+            new StreamClient('http://admin:hunter2@pw@127.0.0.1:9', 'sk_test');
+            self::fail('accepted');
+        } catch (\InvalidArgumentException $e) {
+            self::assertStringNotContainsString('hunter2', $e->getMessage());
         }
     }
 
@@ -297,6 +305,46 @@ final class CurlTransportTest extends TestCase
             self::fail('a baseUrl without a scheme was accepted');
         } catch (\InvalidArgumentException $e) {
             self::assertStringContainsString('baseUrl', $e->getMessage());
+        }
+        usleep(50_000);
+        self::assertSame([], self::server()->requests(), 'nothing reached the server');
+    }
+
+    /**
+     * User info in baseUrl is a transport question (spec 2.2, vectors options.baseUrls.credentials). curl sends it, as
+     * Basic credentials, so with this transport it stays accepted and goes where it was told. But curl takes the FIRST
+     * @ for the end of the user info, so a password holding a raw @ left a host curl refuses, and every call failed as
+     * a retried network error: that one is refused when the client is made; written as %40 it works.
+     */
+    #[Test]
+    public function curlSendsUserInfoSoItIsAcceptedExceptARawAtWhichCurlCannotSend(): void
+    {
+        $withUser = static fn (string $userInfo): string => str_replace('http://', "http://$userInfo@", self::server()->baseUrl('echo'));
+        foreach (['user:hunter2' => 'user:hunter2', 'hunter2' => 'hunter2:', 'user:p%40hunter2' => 'user:p@hunter2'] as $userInfo => $sent) {
+            self::server()->forget();
+            (new StreamClient($withUser($userInfo), 'sk_test', retries: 0, timeoutMs: 2000))->getUsage();
+            $seen = self::server()->requests();
+            self::assertCount(1, $seen, $userInfo);
+            self::assertSame('Basic ' . base64_encode($sent), $seen[0]['headers']['authorization'] ?? null, $userInfo);
+            self::assertSame('sk_test', $seen[0]['headers']['x-api-key'] ?? null);
+            self::assertSame('/echo/v1/usage', $seen[0]['path']);
+        }
+        self::server()->forget();
+        foreach ([null, new CurlTransport()] as $transport) {
+            try {
+                new StreamClient($withUser('user:p@hunter2'), 'sk_test', transport: $transport);
+                self::fail('a raw @ in the password was accepted with curl');
+            } catch (\InvalidArgumentException $e) {
+                self::assertStringStartsWith('baseUrl holds an @ in its user info', $e->getMessage());
+                self::assertStringNotContainsString('hunter2', $e->getMessage());
+            }
+        }
+        // Why: curl itself refuses that URL, on every call.
+        try {
+            (new CurlTransport())->send(new Request('GET', $withUser('user:p@hunter2') . '/v1/rooms', [], null, 2000, false));
+            self::fail('curl sent it');
+        } catch (TransportException $e) {
+            self::assertStringContainsString('cURL error 3', $e->getMessage());
         }
         usleep(50_000);
         self::assertSame([], self::server()->requests(), 'nothing reached the server');
@@ -390,6 +438,24 @@ final class CurlTransportTest extends TestCase
         self::assertSame(1, $this->gets());
     }
 
+    /**
+     * Spec 3.5 (N049-4): the body of a refused redirect is not read. curl read it to its end, so a 302 whose body
+     * stalled held the request until the deadline, and then failed as a retryable `network` error, retried, instead
+     * of `redirected` at once.
+     */
+    #[Test]
+    public function aRedirectWhoseBodyStallsIsRefusedAtOnceWithoutReadingIt(): void
+    {
+        $c = $this->real('redirect-stall', timeoutMs: 5000, retries: 2);
+        $started = hrtime(true);
+        $e = $this->failure(static fn () => $c->getBalance());
+        $elapsedMs = (hrtime(true) - $started) / 1e6;
+        self::assertSame(['redirected', 302], [$e->getErrorCode(), $e->getStatus()], $e->getMessage());
+        self::assertStringContainsString('/landed/v1/billing/balance', $e->getMessage());
+        self::assertLessThan(2000, $elapsedMs, "took {$elapsedMs} ms");
+        self::assertSame(1, $this->gets(), 'not retried');
+    }
+
     #[Test]
     public function theRatesFollowARedirectAndTheReplyTheyLandOnIsCappedToo(): void
     {
@@ -411,7 +477,7 @@ final class CurlTransportTest extends TestCase
             CURLOPT_WRITEFUNCTION => static fn (\CurlHandle $h, string $data): int => strlen($data),
         ]);
         $c = new StreamClient(self::server()->baseUrl('ok'), 'sk_test', retries: 0, transport: $transport);
-        self::assertSame(['ok' => true], $c->listRooms(), 'the body reaches the client');
+        self::assertSame(['ok' => true], $c->getUsage(), 'the body reaches the client');
         $big = self::server()->baseUrl('big-stream/' . (2 * StreamClient::MAX_REPLY_BYTES));
         $c = new StreamClient($big, 'sk_test', retries: 0, timeoutMs: 10000, transport: $transport);
         $e = $this->failure(static fn () => $c->listRooms());

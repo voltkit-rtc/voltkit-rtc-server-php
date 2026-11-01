@@ -174,9 +174,15 @@ final class WebhooksTest extends TestCase
         self::assertFalse($verify(self::GOLDEN_TS + 301), '301 s old is refused');
         self::assertTrue($verify(self::GOLDEN_TS - 300), '300 s in the future is accepted');
         self::assertFalse($verify(self::GOLDEN_TS - 301), '301 s in the future is refused');
-        self::assertFalse($verify(self::GOLDEN_TS + 300.5), 'fractions count');
+        // Whole seconds (X-2): the clock's second against the header's, so 300.999 s old passes as 300 s does.
+        self::assertTrue($verify(self::GOLDEN_TS + 300.5), 'a fraction of a second past the window is still its second');
+        self::assertTrue($verify(self::GOLDEN_TS + 300.999));
+        self::assertFalse($verify(self::GOLDEN_TS - 300.5), 'half a second before 300 s in the future is the second before');
         self::assertTrue($verify(self::GOLDEN_TS, 0), 'tolerance 0 accepts the exact second');
+        self::assertTrue($verify(self::GOLDEN_TS + 0.5, 0), 'and any time within it');
+        self::assertTrue($verify(self::GOLDEN_TS + 0.999, 0));
         self::assertFalse($verify(self::GOLDEN_TS + 1, 0), 'and refuses one second later');
+        self::assertFalse($verify(self::GOLDEN_TS - 0.001, 0), 'and a moment before it');
         self::assertTrue($verify(self::GOLDEN_TS + 3600, 7200));
         self::assertFalse($verify(self::GOLDEN_TS + 3600, 300));
         self::assertTrue($verify(2102360000, 3153600000), 'a very large tolerance lifts the check');
@@ -242,6 +248,107 @@ final class WebhooksTest extends TestCase
             self::fail('accepted');
         } catch (\InvalidArgumentException $e) {
             self::assertStringContainsString('now', $e->getMessage());
+        }
+    }
+
+    /** @return iterable<string, array{0: mixed, 1: class-string<\Throwable>}> */
+    public static function badClocks(): iterable
+    {
+        yield 'NaN' => [NAN, \RangeException::class];
+        yield 'Infinity' => [INF, \RangeException::class];
+        yield '-Infinity' => [-INF, \RangeException::class];
+        yield 'a closure returning NaN' => [static fn (): float => NAN, \RangeException::class];
+        yield 'a closure returning Infinity' => [static fn (): float => INF, \RangeException::class];
+        yield 'a numeric string' => ['1787000000', \InvalidArgumentException::class];
+        yield 'true' => [true, \InvalidArgumentException::class];
+        yield 'a closure returning a string' => [static fn (): string => '1787000000', \InvalidArgumentException::class];
+    }
+
+    /**
+     * X-3, PHP011-3: NaN as the clock turned the age check off (every comparison with NaN is false), so a captured
+     * delivery verified forever. A clock that is no finite number is a programmer error, before any HMAC.
+     *
+     * @param class-string<\Throwable> $class
+     */
+    #[Test]
+    #[DataProvider('badClocks')]
+    public function aClockThatIsNoFiniteNumberIsAProgrammerErrorNeverAVerdict(mixed $now, string $class): void
+    {
+        $header = 't=' . self::GOLDEN_TS . ',v1=' . self::GOLDEN_CURRENT;
+        foreach (['verify', 'parse'] as $fn) {
+            foreach ([['now' => $now], ['now' => $now, 'toleranceSeconds' => 0], ['now' => $now, 'toleranceSeconds' => INF]] as $options) {
+                $thrown = null;
+                try {
+                    // @phpstan-ignore argument.type (a deliberately wrong clock)
+                    $fn === 'verify' ? Webhooks::verify(self::GOLDEN_BODY, $header, 'whsec_golden_current', $options)
+                        // @phpstan-ignore argument.type (a deliberately wrong clock)
+                        : Webhooks::parse(self::GOLDEN_BODY, $header, 'whsec_golden_current', $options);
+                } catch (\Throwable $t) {
+                    $thrown = $t;
+                }
+                self::assertInstanceOf($class, $thrown, $fn);
+                self::assertStringStartsWith('now must be ', $thrown->getMessage());
+            }
+        }
+        // Before any HMAC: a header that could never verify changes nothing.
+        $this->expectException($class);
+        // @phpstan-ignore argument.type (a deliberately wrong clock)
+        Webhooks::verify(self::GOLDEN_BODY, 'garbage', 'whsec_golden_current', ['now' => $now]);
+    }
+
+    /** @return iterable<string, array{0: string}> */
+    public static function blankSecrets(): iterable
+    {
+        yield 'a space' => [' '];
+        yield 'a tab' => ["\t"];
+        yield 'a line feed' => ["\n"];
+        yield 'CR LF' => ["\r\n"];
+        yield 'a form feed' => ["\f"];
+        yield 'a vertical tab' => ["\x0B"];
+        yield 'several kinds' => [" \t\r\n\f\x0B "];
+        yield 'a no-break space (JavaScript trims it)' => ["\u{00A0}"];
+        yield 'an ideographic space' => ["\u{3000}"];
+        yield 'a line separator' => ["\u{2028}"];
+        yield 'a byte order mark' => ["\u{FEFF}"];
+    }
+
+    /**
+     * D5, X-4: HMAC takes " " as a key, so a delivery signed with it verified. A secret that is only whitespace counts
+     * as absent, exactly like an empty one: never a key, beside a real secret or alone.
+     */
+    #[Test]
+    #[DataProvider('blankSecrets')]
+    public function aWhitespaceOnlySecretCountsAsAbsent(string $blank): void
+    {
+        $body = self::GOLDEN_BODY;
+        $signedWithBlank = self::sign($body, self::GOLDEN_TS, $blank);
+        $o = ['now' => self::GOLDEN_TS];
+        foreach ([$blank, [$blank], [$blank, ''], ['', $blank, "$blank$blank"]] as $secrets) {
+            foreach (['verify', 'parse'] as $fn) {
+                try {
+                    $fn === 'verify' ? Webhooks::verify($body, $signedWithBlank, $secrets, $o) : Webhooks::parse($body, $signedWithBlank, $secrets, $o);
+                    self::fail("$fn: a blank secret was used");
+                } catch (\InvalidArgumentException $e) {
+                    self::assertStringContainsString('needs the signing secret', $e->getMessage());
+                }
+            }
+        }
+        self::assertFalse(Webhooks::verify($body, $signedWithBlank, [$blank, 'whsec_golden_current'], $o), 'beside a real secret, first');
+        self::assertFalse(Webhooks::verify($body, $signedWithBlank, ['whsec_golden_current', $blank], $o), 'and last');
+        $golden = 't=' . self::GOLDEN_TS . ',v1=' . self::GOLDEN_CURRENT;
+        self::assertTrue(Webhooks::verify($body, $golden, [$blank, 'whsec_golden_current'], $o), 'the real one still verifies');
+        // Whitespace around real text is part of the secret: the whole string is the key.
+        $padded = "{$blank}whsec_padded{$blank}";
+        self::assertTrue(Webhooks::verify($body, self::sign($body, self::GOLDEN_TS, $padded), $padded, $o));
+        self::assertFalse(Webhooks::verify($body, self::sign($body, self::GOLDEN_TS, $padded), 'whsec_padded', $o));
+    }
+
+    #[Test]
+    public function aSecretOfOtherBytesIsStillASecret(): void
+    {
+        // Not whitespace, so a key (a strange one): a NUL, and bytes that are not UTF-8.
+        foreach (["\0", "\xA0", "\xFF\xFE"] as $secret) {
+            self::assertTrue(Webhooks::verify(self::GOLDEN_BODY, self::sign(self::GOLDEN_BODY, self::GOLDEN_TS, $secret), $secret, ['now' => self::GOLDEN_TS]));
         }
     }
 
@@ -328,6 +435,29 @@ final class WebhooksTest extends TestCase
             $thrown = $e;
         }
         self::assertInstanceOf(\UnexpectedValueException::class, $thrown, 'a list is not an event');
+    }
+
+    /**
+     * PHP011-4: json_decode() makes [] and {} the same empty array, and {"0":1} a list, so array_is_list() on the
+     * decoded value let [] through as an event and refused {"0":1}. An object is told from a list by the JSON itself.
+     */
+    #[Test]
+    public function parseTellsAnObjectFromAListByTheJsonItself(): void
+    {
+        $o = ['now' => self::GOLDEN_TS];
+        $parse = static fn (string $body): array => Webhooks::parse($body, self::sign($body, self::GOLDEN_TS), self::SECRET, $o);
+        foreach (['[]', '[{"id":"evt_1"}]', ' [] ', "\n[1]", '"text"', '5', 'true', 'null'] as $body) {
+            try {
+                $parse($body);
+                self::fail("parsed $body");
+            } catch (\UnexpectedValueException $e) {
+                self::assertSame('the webhook body verified but is not a JSON object', $e->getMessage());
+            }
+        }
+        self::assertSame([], $parse('{}'), 'an empty object is an object');
+        self::assertSame([0 => 1], $parse('{"0":1}'), 'and so is one whose keys are numbers');
+        self::assertSame(['0' => 'a', '1' => 'b'], $parse('{"0":"a","1":"b"}'));
+        self::assertSame(['id' => 'evt_1'], $parse(" \t\r\n{\"id\":\"evt_1\"}\n"), 'JSON whitespace around it');
     }
 
     #[Test]

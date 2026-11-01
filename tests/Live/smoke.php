@@ -134,6 +134,9 @@ try {
     $step('rooms');
     $rooms = $rtc->listRooms();
     $check(($rooms['rooms'] ?? null) === [], 'listRooms: empty', $j($rooms));
+    // PHP011-4 (0.1.2): a baseUrl read from a file with its line feed, and a slash, works against the real controller.
+    $fromFile = (new StreamClient("$orchUrl/\n", $key, null, 10000, 2, new CountingTransport()))->listRooms();
+    $check(($fromFile['rooms'] ?? null) === [], 'a baseUrl with a slash and a line feed after it: listRooms works', $j($fromFile));
 
     $room = $rtc->ensureRoom($roomId, 'host-1', ['seats' => 8]);
     $check($room['existed'] === false && $room['roomId'] === $roomId && is_string($room['hostToken']) && is_string($room['wsUrl']), 'ensureRoom: 201, existed false', $j($room));

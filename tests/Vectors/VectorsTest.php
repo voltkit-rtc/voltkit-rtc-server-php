@@ -14,6 +14,8 @@ use VoltKit\Rtc\Tests\Support\Calls;
 use VoltKit\Rtc\Tests\Support\FakeTransport;
 use VoltKit\Rtc\Tests\Support\MakesClients;
 use VoltKit\Rtc\Tests\Support\Vectors;
+use VoltKit\Rtc\Tests\Support\WeakCalls;
+use VoltKit\Rtc\Transport\CurlTransport;
 use VoltKit\Rtc\Webhooks;
 
 /**
@@ -25,11 +27,12 @@ final class VectorsTest extends TestCase
     use MakesClients;
 
     /**
-     * A fake transport playing the vectors' reply or steps.
+     * A fake transport playing the vectors' reply or steps. Each body is taken from `$twin`, the same case with its
+     * JSON objects kept as objects: decoded to arrays, {} would be sent as [] and {"0":1} as a list.
      *
      * @param array<string, mixed> $case
      */
-    private static function transportFor(array $case): FakeTransport
+    private static function transportFor(array $case, \stdClass $twin): FakeTransport
     {
         if (isset($case['transportError']) && is_string($case['transportError'])) {
             return FakeTransport::failing($case['transportError']);
@@ -37,12 +40,27 @@ final class VectorsTest extends TestCase
         if (isset($case['steps']) && is_array($case['steps'])) {
             /** @var list<array<string, mixed>> $steps */
             $steps = array_values($case['steps']);
-            return new FakeTransport(...$steps);
+            $twins = is_array($twin->steps ?? null) ? $twin->steps : [];
+        } else {
+            $reply = $case['reply'] ?? ['status' => 200, 'body' => new \stdClass()];
+            assert(is_array($reply));
+            /** @var array<string, mixed> $reply */
+            $steps = [$reply];
+            $twins = [$twin->reply ?? null];
         }
-        $reply = $case['reply'] ?? ['status' => 200, 'body' => []];
-        assert(is_array($reply));
-        /** @var array<string, mixed> $reply */
-        return new FakeTransport($reply);
+        foreach ($steps as $i => $step) {
+            $faithful = $twins[$i] ?? null;
+            if (array_key_exists('body', $step) && $faithful instanceof \stdClass && property_exists($faithful, 'body')) {
+                $steps[$i]['body'] = $faithful->body;
+            }
+        }
+        return new FakeTransport(...$steps);
+    }
+
+    /** `$value` as the client hands JSON back: objects as arrays. */
+    private static function plain(mixed $value): mixed
+    {
+        return json_decode(json_encode($value, JSON_THROW_ON_ERROR), true, 512, JSON_THROW_ON_ERROR);
     }
 
     /** @param array<string, mixed> $case */
@@ -121,7 +139,12 @@ final class VectorsTest extends TestCase
         self::assertSame($c['ratesPath'], StreamClient::RATES_PATH);
         $wh = self::arr($c['webhookHeader'], 'webhookHeader');
         self::assertSame($wh['maxHeaderLength'], Webhooks::MAX_HEADER_LENGTH);
-        self::assertSame('0.4.9', $c['nodeSdkVersion'], 'the vectors were regenerated from another Node SDK: review the changes');
+        self::assertSame('0.4.10', $c['nodeSdkVersion'], 'the vectors were regenerated from another Node SDK: review the changes');
+        // The words of a 2xx that is not what the call needs (spec 3.6), as this SDK writes them.
+        $shape = self::arr($c['replyShape'], 'replyShape');
+        assert(is_string($shape['messagePrefix']) && is_string($shape['notAnObject']));
+        $e = $this->failure(fn () => $this->client(FakeTransport::raw(200, '[]'), retries: 0)->getBalance());
+        self::assertSame('GET /v1/billing/balance: ' . $shape['messagePrefix'] . $shape['notAnObject'], $e->getMessage());
     }
 
     #[Test]
@@ -198,6 +221,59 @@ final class VectorsTest extends TestCase
                 self::assertSame($case['expected'], Webhooks::verify($case['body'], $header, $secrets, $options), "$name (as a list)");
             }
         }
+
+        // Whole seconds (X-2): the clock in milliseconds, given here as seconds with a fraction.
+        $count = 0;
+        foreach (self::arr($w['wholeSeconds'], 'wholeSeconds') as $case) {
+            $case = self::arr($case, 'case');
+            $name = $case['name'];
+            assert(is_string($name) && is_string($case['body']) && is_string($case['header']) && is_array($case['secrets']));
+            assert(is_int($case['nowUnixMillis']) && (is_int($case['toleranceSeconds']) || is_float($case['toleranceSeconds'])));
+            /** @var list<string> $secrets */
+            $secrets = $case['secrets'];
+            $options = ['now' => $case['nowUnixMillis'] / 1000, 'toleranceSeconds' => $case['toleranceSeconds']];
+            self::assertSame($case['expected'], Webhooks::verify($case['body'], $case['header'], $secrets, $options), $name);
+            // The same clock as a closure.
+            $options['now'] = static fn (): float => $case['nowUnixMillis'] / 1000;
+            self::assertSame($case['expected'], Webhooks::verify($case['body'], $case['header'], $secrets, $options), "$name (a closure)");
+            $count++;
+        }
+        self::assertSame(10, $count);
+
+        // A clock that is no finite number (X-3, PHP011-3) is an argument error, never a verdict.
+        $bad = self::arr($w['badNow'], 'badNow');
+        assert(is_string($bad['body']) && is_string($bad['header']) && is_array($bad['secrets']));
+        /** @var list<string> $secrets */
+        $secrets = $bad['secrets'];
+        $clocks = [];
+        foreach (self::arr($bad['notFinite'], 'notFinite') as $spelt) {
+            $clocks[] = [match ($spelt) {
+                'NaN' => NAN,
+                'Infinity' => INF,
+                '-Infinity' => -INF,
+                default => throw new \LogicException('unknown spelling ' . var_export($spelt, true)),
+            }, \RangeException::class];
+        }
+        foreach (self::arr($bad['notNumbers'], 'notNumbers') as $value) {
+            $clocks[] = [$value, \InvalidArgumentException::class];
+        }
+        self::assertCount(5, $clocks);
+        foreach ($clocks as [$now, $class]) {
+            foreach ([$now, static fn (): mixed => $now] as $clock) {
+                $what = var_export($now, true) . ($clock instanceof \Closure ? ' (a closure)' : '');
+                $thrown = null;
+                try {
+                    // @phpstan-ignore argument.type (a deliberately wrong clock)
+                    Webhooks::verify($bad['body'], $bad['header'], $secrets, ['now' => $clock, 'toleranceSeconds' => INF]);
+                } catch (\Throwable $t) {
+                    $thrown = $t;
+                }
+                self::assertInstanceOf($class, $thrown, "$what: the language's argument error, never a verdict");
+                self::assertStringStartsWith('now must be ', $thrown->getMessage(), $what);
+            }
+        }
+        // An unset clock is still the clock: the golden delivery is years old.
+        self::assertFalse(Webhooks::verify($bad['body'], $bad['header'], $secrets));
 
         foreach (self::arr($w['parse'], 'parse') as $case) {
             $case = self::arr($case, 'case');
@@ -339,6 +415,120 @@ final class VectorsTest extends TestCase
                 self::assertError($e, self::arr($expected['ratesError'], 'ratesError'), (string) $case['baseUrl']);
             }
         }
+        $this->baseUrls(self::arr($o['baseUrls'], 'baseUrls'));
+    }
+
+    /**
+     * What a baseUrl, and the same ratesBaseUrl, must be (D8, PHP011-4): refused when the client is made, with the
+     * language's argument error, in words that quote no part of it.
+     *
+     * @param array<string, mixed> $b
+     */
+    private function baseUrls(array $b): void
+    {
+        $rates = new FakeTransport(['status' => 200, 'body' => ['rooms' => [], 'success' => true, 'data' => ['version' => 3]]]);
+        foreach (self::arr($b['accepted'], 'accepted') as $case) {
+            $case = self::arr($case, 'case');
+            assert(is_string($case['baseUrl']) && is_string($case['roomsUrl']) && is_string($case['name']));
+            $t = new FakeTransport(['status' => 200, 'body' => ['rooms' => []]]);
+            $this->client($t, baseUrl: $case['baseUrl'])->listRooms();
+            self::assertSame($case['roomsUrl'], $t->last()->url, $case['name']);
+            // The same as ratesBaseUrl: the rates path goes where the rooms path went.
+            $this->client($rates, ratesBaseUrl: $case['baseUrl'])->getRates();
+            self::assertSame(substr($case['roomsUrl'], 0, -strlen('/v1/rooms')) . StreamClient::RATES_PATH, $rates->last()->url, $case['name']);
+        }
+        $count = 0;
+        foreach (self::arr($b['refused'], 'refused') as $case) {
+            $case = self::arr($case, 'case');
+            assert(is_string($case['baseUrl']) && is_string($case['name']));
+            $expected = self::arr($case['expected'], 'expected');
+            assert(is_string($expected['nodeMessage']));
+            foreach (['baseUrl', 'ratesBaseUrl'] as $option) {
+                $e = $this->refusedUrl($option, $case['baseUrl'], $case['name']);
+                // The sense of Node's words, and here the same words.
+                self::assertSame(str_replace('baseUrl', $option, $expected['nodeMessage']), $e->getMessage(), "{$case['name']} as $option");
+                $mustNotShow = $case['mustNotShow'] ?? null;
+                foreach (is_array($mustNotShow) ? $mustNotShow : (is_string($mustNotShow) ? [$mustNotShow] : []) as $secret) {
+                    assert(is_string($secret));
+                    self::assertStringNotContainsString($secret, $e->getMessage(), $case['name']);
+                }
+            }
+            $count++;
+        }
+        self::assertSame(38, $count);
+        foreach (self::arr($b['required'], 'required') as $case) {
+            $case = self::arr($case, 'case');
+            assert(is_string($case['baseUrl']));
+            $what = var_export($case['baseUrl'], true);
+            try {
+                new StreamClient($case['baseUrl'], 'sk_test', transport: new FakeTransport());
+                self::fail("$what: accepted");
+            } catch (\InvalidArgumentException $e) {
+                self::assertStringStartsWith('baseUrl is required', $e->getMessage(), $what);
+            }
+            // As ratesBaseUrl: unset.
+            $e = $this->failure(fn () => $this->client(new FakeTransport(), ratesBaseUrl: $case['baseUrl'])->getRates());
+            self::assertSame(['rates-unconfigured', 0], [$e->getErrorCode(), $e->getStatus()], $what);
+        }
+        // Not a string: PHP's own type check, before the constructor runs (this file is strict_types).
+        foreach (self::arr($b['notStrings'], 'notStrings') as $case) {
+            $case = self::arr($case, 'case');
+            $value = $case['baseUrl'];
+            foreach (['baseUrl', 'ratesBaseUrl'] as $option) {
+                $thrown = null;
+                try {
+                    // @phpstan-ignore argument.type, argument.type (deliberately not a string)
+                    $option === 'baseUrl' ? new StreamClient($value, 'sk_test') : new StreamClient('https://x.test', 'sk_test', $value);
+                } catch (\Throwable $t) {
+                    $thrown = $t;
+                }
+                self::assertInstanceOf(\TypeError::class, $thrown, var_export($value, true) . " as $option");
+            }
+        }
+        // User info is a transport question: curl sends it (Basic), except a raw @ in it, which curl takes for the end
+        // of the user info (tests/Transport/CurlTransportTest proves both). A transport of the caller's gets it as given.
+        $credentials = self::arr($b['credentials'], 'credentials');
+        foreach (self::arr($credentials['urls'], 'urls') as $url) {
+            assert(is_string($url));
+            $t = new FakeTransport(['status' => 200, 'body' => ['rooms' => []]]);
+            $c = $this->client($t, baseUrl: $url);
+            $c->listRooms();
+            self::assertSame("$url/v1/rooms", $t->last()->url, 'a transport of the caller\'s gets it as given');
+            self::assertStringNotContainsString('hunter2', (string) $c, 'and it is never shown');
+            self::assertStringNotContainsString('hunter2', print_r($c, true));
+            $userInfo = substr($url, strlen('https://'), (int) strrpos($url, '@') - strlen('https://'));
+            if (str_contains($userInfo, '@')) {
+                $e = $this->refusedUrl('baseUrl', $url, 'an @ in the user info, with curl', withCurl: true);
+                self::assertStringContainsString('curl', $e->getMessage());
+            } else {
+                new StreamClient($url, 'sk_test', transport: new CurlTransport());
+                new StreamClient($url, 'sk_test');
+            }
+        }
+    }
+
+    /** The \InvalidArgumentException making a client with `$url` as `$option` fails with; nothing sent. */
+    private function refusedUrl(string $option, string $url, string $name, bool $withCurl = false): \InvalidArgumentException
+    {
+        $t = new FakeTransport();
+        try {
+            if ($option === 'baseUrl') {
+                new StreamClient($url, 'sk_test', transport: $withCurl ? new CurlTransport() : $t);
+            } else {
+                new StreamClient('https://x.test', 'sk_test', $url, transport: $withCurl ? new CurlTransport() : $t);
+            }
+        } catch (\InvalidArgumentException $e) {
+            self::assertSame(0, $t->attempts(), "$name: nothing is sent");
+            self::assertNull($e->getPrevious(), "$name: no cause that could carry the URL");
+            // No part of what was given: the user info, the host, the path.
+            foreach (preg_split('~[:/@?#.\s]+~', $url, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $part) {
+                if (strlen($part) >= 6 && !in_array(strtolower($part), ['https', 'http'], true)) {
+                    self::assertStringNotContainsString($part, $e->getMessage(), "$name: quotes $part");
+                }
+            }
+            return $e;
+        }
+        self::fail("$name: $option accepted");
     }
 
     /** @param array<string, mixed> $expected */
@@ -401,10 +591,78 @@ final class VectorsTest extends TestCase
         foreach (self::arr($ids['encoded'], 'encoded') as $case) {
             $case = self::arr($case, 'case');
             assert(is_string($case['id']));
-            $t = new FakeTransport(['status' => 200, 'body' => []]);
+            $t = new FakeTransport(['status' => 200, 'body' => ['room' => new \stdClass()]]);
             $this->client($t)->getRoom($case['id']);
             assert(is_string($case['segment']));
             self::assertSame('https://x.test/v1/rooms/' . $case['segment'], $t->last()->url, $case['id']);
+        }
+
+        // An id that is no string (D6). PHP's declared string type is this SDK's check, and it runs before the method
+        // does: null, an array and an object are a TypeError at every place, from a strict file and a weak one alike,
+        // and nothing is sent. A strict file (this one) refuses a boolean and a number the same way.
+        $notStrings = Vectors::faithful('ids')->notStrings;
+        assert($notStrings instanceof \stdClass && is_array($notStrings->cases));
+        foreach ($notStrings->cases as $case) {
+            assert($case instanceof \stdClass && is_string($case->name));
+            foreach (Calls::PLACES as [$method, $param]) {
+                $args = Calls::argsWithId($method, $param, $case->id);
+                $what = "$method $param {$case->name}";
+                $t = new FakeTransport();
+                $thrown = null;
+                try {
+                    Calls::direct($this->client($t), $method, $args);
+                } catch (\Throwable $e) {
+                    $thrown = $e;
+                }
+                self::assertInstanceOf(\TypeError::class, $thrown, "$what: refused by the declared type");
+                self::assertSame(0, $t->attempts(), "$what: nothing is sent");
+                if (is_bool($case->id)) {
+                    // A weak-mode file converts a boolean before the SDK sees it: false is "" (refused, nothing
+                    // sent), true is "1", a valid id, and is sent. The language's conversion; README "Ids".
+                    $weak = new FakeTransport(['status' => 200, 'body' => ['token' => 't', 'roomId' => 'r', 'room' => new \stdClass(), 'channel' => 'c', 'id' => '1', 'streamId' => 's']]);
+                    if ($case->id) {
+                        WeakCalls::direct($this->client($weak), $method, $args);
+                        self::assertStringContainsString('/1', $weak->last()->url, "$what, weak mode: true is \"1\"");
+                    } else {
+                        $client = $this->client($weak);
+                        $e = $this->failure(static fn () => WeakCalls::direct($client, $method, $args));
+                        self::assertSame(['bad-request', 0], [$e->getErrorCode(), $e->getStatus()], "$what, weak mode");
+                        self::assertSame(0, $weak->attempts(), "$what, weak mode: nothing is sent");
+                    }
+                    continue;
+                }
+                $thrown = null;
+                try {
+                    WeakCalls::direct($this->client($t), $method, $args);
+                } catch (\Throwable $e) {
+                    $thrown = $e;
+                }
+                self::assertInstanceOf(\TypeError::class, $thrown, "$what, weak mode: refused by the declared type");
+                self::assertSame(0, $t->attempts(), "$what, weak mode: nothing is sent");
+            }
+        }
+
+        // A number: a strict file cannot pass one (TypeError, nothing sent); a weak-mode file passes its digits, as
+        // the vectors want, at every place.
+        foreach (self::arr($ids['numbers'], 'numbers') as $case) {
+            $case = self::arr($case, 'case');
+            assert((is_int($case['id']) || is_float($case['id'])) && is_string($case['segment']));
+            foreach (Calls::PLACES as [$method, $param]) {
+                $args = Calls::argsWithId($method, $param, $case['id']);
+                $t = new FakeTransport(['status' => 200, 'body' => ['token' => 't', 'roomId' => 'r', 'room' => new \stdClass(), 'channel' => 'c', 'id' => '1', 'streamId' => 's']]);
+                $thrown = null;
+                try {
+                    Calls::direct($this->client($t), $method, $args);
+                } catch (\TypeError $e) {
+                    $thrown = $e;
+                }
+                self::assertNotNull($thrown, "$method $param {$case['id']}: strict");
+                self::assertSame(0, $t->attempts());
+                WeakCalls::direct($this->client($t), $method, $args);
+                self::assertSame(1, $t->attempts(), "$method $param {$case['id']}: weak mode sends it");
+                $path = (string) parse_url($t->last()->url, PHP_URL_PATH);
+                self::assertContains($case['segment'], explode('/', $path), "$method $param: the digits as one segment");
+            }
         }
     }
 
@@ -412,12 +670,12 @@ final class VectorsTest extends TestCase
     public function redaction(): void
     {
         $section = Vectors::section('redaction');
-        foreach (self::arr($section['cases'], 'cases') as $case) {
+        foreach (self::arr($section['cases'], 'cases') as $i => $case) {
             $case = self::arr($case, 'case');
             $name = $case['name'];
             $method = $case['method'];
             assert(is_string($name) && is_string($method));
-            $t = self::transportFor($case);
+            $t = self::transportFor($case, Vectors::faithfulCase('redaction', 'cases', $i));
             $c = $this->clientFor(['retries' => 0] + $case, $t);
             $e = $this->failure(static fn () => Calls::invoke($c, $method));
             self::assertError($e, self::arr($case['expected'], 'expected'), $name);
@@ -459,8 +717,8 @@ final class VectorsTest extends TestCase
     public function retry(): void
     {
         $section = Vectors::section('retry');
-        foreach (self::arr($section['cases'], 'cases') as $case) {
-            $this->runStepCase(self::arr($case, 'case'));
+        foreach (self::arr($section['cases'], 'cases') as $i => $case) {
+            $this->runStepCase(self::arr($case, 'case'), Vectors::faithfulCase('retry', 'cases', $i));
         }
         foreach (self::arr($section['registry'], 'registry') as $entry) {
             $entry = self::arr($entry, 'entry');
@@ -486,8 +744,8 @@ final class VectorsTest extends TestCase
     public function goneIsDone(): void
     {
         $count = 0;
-        foreach (self::arr(Vectors::section('goneIsDone')['cases'], 'cases') as $case) {
-            $this->runStepCase(self::arr($case, 'case'));
+        foreach (self::arr(Vectors::section('goneIsDone')['cases'], 'cases') as $i => $case) {
+            $this->runStepCase(self::arr($case, 'case'), Vectors::faithfulCase('goneIsDone', 'cases', $i));
             $count++;
         }
         self::assertSame(44, $count);
@@ -498,12 +756,12 @@ final class VectorsTest extends TestCase
      *
      * @param array<string, mixed> $case
      */
-    private function runStepCase(array $case): void
+    private function runStepCase(array $case, \stdClass $twin): void
     {
         $name = $case['name'];
         $call = $case['call'];
         assert(is_string($name) && is_string($call));
-        $t = self::transportFor($case);
+        $t = self::transportFor($case, $twin);
         $c = $this->clientFor($case, $t);
         $expected = self::arr($case['expected'], 'expected');
         if (isset($expected['resolves'])) {
@@ -523,13 +781,13 @@ final class VectorsTest extends TestCase
     #[Test]
     public function messages(): void
     {
-        foreach (self::arr(Vectors::section('messages')['cases'], 'cases') as $case) {
+        foreach (self::arr(Vectors::section('messages')['cases'], 'cases') as $i => $case) {
             $case = self::arr($case, 'case');
             $name = $case['name'];
             $method = $case['method'];
             assert(is_string($name) && is_string($method));
             $expected = self::arr($case['expected'], 'expected');
-            $t = self::transportFor($case);
+            $t = self::transportFor($case, Vectors::faithfulCase('messages', 'cases', $i));
             $c = $this->clientFor(['retries' => 0] + $case, $t);
             if (isset($expected['programmerError'])) {
                 try {
@@ -562,13 +820,13 @@ final class VectorsTest extends TestCase
     public function requests(): void
     {
         $count = 0;
-        foreach (self::arr(Vectors::section('requests')['cases'], 'cases') as $case) {
+        foreach (self::arr(Vectors::section('requests')['cases'], 'cases') as $i => $case) {
             $case = self::arr($case, 'case');
             $label = $case['method'];
             assert(is_string($label));
             $args = self::arr($case['args'], 'args');
             $expected = self::arr($case['expected'], 'expected');
-            $t = self::transportFor($case);
+            $t = self::transportFor($case, Vectors::faithfulCase('requests', 'cases', $i));
             $rates = Calls::methodName($label) === 'getRates' ? 'https://api.example.com/' : null;
             $c = $this->client($t, ratesBaseUrl: $rates);
             $result = Calls::invoke($c, $label, $args);
@@ -592,13 +850,81 @@ final class VectorsTest extends TestCase
             if ($expected['result'] === null) {
                 self::assertNull($result);
             }
-            $again = self::transportFor(['reply' => ['status' => 503, 'body' => ['error' => 'unavailable']]]);
+            $again = new FakeTransport(['status' => 503, 'body' => ['error' => 'unavailable']]);
             $this->failure(fn () => Calls::invoke($this->client($again, ratesBaseUrl: $rates), $label, $args));
             self::assertSame($expected['attemptsOn503'], $again->attempts(), "$label: attempts on 503");
             self::assertSame($expected['safeToRepeat'], $again->attempts() > 1, "$label: safe to repeat");
             $count++;
         }
         self::assertSame(33, $count);
+    }
+
+    /**
+     * What a 2xx must be, per call (X-1, PHP011-1, D4; spec 3.6): refused with http-<status>, not retried, in words
+     * that quote nothing of the reply; or resolved, with the fields named.
+     */
+    #[Test]
+    public function replies(): void
+    {
+        $count = 0;
+        foreach (self::arr(Vectors::section('replies')['cases'], 'cases') as $i => $case) {
+            $case = self::arr($case, 'case');
+            $name = $case['name'];
+            $method = $case['method'];
+            assert(is_string($name) && is_string($method));
+            $twin = Vectors::faithfulCase('replies', 'cases', $i);
+            $expected = self::arr($case['expected'], 'expected');
+            $t = self::transportFor($case, $twin);
+            $c = $this->client($t, retries: 2);
+            $args = self::arr($case['args'], 'args');
+            if (isset($expected['error'])) {
+                $e = $this->failure(static fn () => Calls::invoke($c, $method, $args));
+                $error = self::arr($expected['error'], 'error');
+                self::assertError($e, $error, $name);
+                self::assertNull($e->getPrevious(), "$name: no cause");
+            } else {
+                $result = Calls::invoke($c, $method, $args);
+                assert($twin->expected instanceof \stdClass);
+                if (property_exists($twin->expected, 'holds')) {
+                    self::assertIsArray($result, $name);
+                    self::assertHolds($twin->expected->holds, $result, $name);
+                }
+                if (property_exists($twin->expected, 'list')) {
+                    self::assertSame(self::plain($twin->expected->list), $result, $name);
+                }
+                if (isset($expected['nothing'])) {
+                    self::assertNull($result, $name);
+                }
+            }
+            self::assertSame($expected['attempts'], $t->attempts(), "$name: attempts");
+            $count++;
+        }
+        self::assertSame(356, $count);
+    }
+
+    /**
+     * Every field the object `$holds` names has that value in `$actual`, recursively, and other fields are not looked
+     * at; a list is the same length and holds each element. `$holds` comes with its objects kept as objects, the only
+     * way to tell {} (nothing pinned) from [] (an empty list).
+     */
+    private static function assertHolds(mixed $holds, mixed $actual, string $what): void
+    {
+        if ($holds instanceof \stdClass) {
+            self::assertIsArray($actual, $what);
+            foreach (get_object_vars($holds) as $key => $value) {
+                self::assertArrayHasKey($key, $actual, "$what: $key");
+                self::assertHolds($value, $actual[$key], "$what: $key");
+            }
+        } elseif (is_array($holds)) {
+            self::assertIsArray($actual, $what);
+            self::assertTrue(array_is_list($actual), "$what: a list");
+            self::assertCount(count($holds), $actual, $what);
+            foreach ($holds as $i => $value) {
+                self::assertHolds($value, $actual[$i], "$what: $i");
+            }
+        } else {
+            self::assertSame($holds, $actual, $what);
+        }
     }
 
     #[Test]

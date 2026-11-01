@@ -6,4 +6,5 @@ parameters:
         - examples
     scanFiles:
         - phpstan-stubs/laravel.stub
+        - phpstan-stubs/curl.stub
     treatPhpDocTypesAsCertain: false

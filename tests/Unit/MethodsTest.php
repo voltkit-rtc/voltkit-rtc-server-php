@@ -84,7 +84,7 @@ final class MethodsTest extends TestCase
         self::assertSame($people, $this->client($t)->listParticipants('show-42'));
         self::assertSame(['GET', 'https://x.test/v1/rooms/show-42/participants', null], $this->sent($t));
 
-        $t = new FakeTransport(['status' => 200, 'body' => []]);
+        $t = new FakeTransport(['status' => 200, 'body' => new \stdClass()]);
         self::assertSame([], $this->client($t)->listParticipants('show-42'));
     }
 
@@ -99,7 +99,7 @@ final class MethodsTest extends TestCase
     #[Test]
     public function chatCallsHitTheChannelTheyNameEncoded(): void
     {
-        $t = new FakeTransport(['status' => 200, 'body' => ['messages' => [], 'muted' => []]]);
+        $t = new FakeTransport(['status' => 200, 'body' => ['messages' => [], 'muted' => [], 'token' => 't', 'channel' => 'show 42', 'id' => '1-0']]);
         $c = $this->client($t);
         $c->createChatToken('show 42', 'u', Role::Moderator);
         $c->createChatToken('show 42', 'u');
@@ -135,12 +135,12 @@ final class MethodsTest extends TestCase
         $message = ['id' => '1-0', 'channel' => 'c', 'from' => 'system', 'type' => 'system', 'text' => 'hi', 'ts' => 1755600000000];
         $t = new FakeTransport(['status' => 200, 'body' => ['messages' => [$message]]]);
         self::assertSame([$message], $this->client($t)->listMessages('c'));
-        $t = new FakeTransport(['status' => 200, 'body' => []]);
+        $t = new FakeTransport(['status' => 200, 'body' => new \stdClass()]);
         self::assertSame([], $this->client($t)->listMessages('c'));
 
         $t = new FakeTransport(['status' => 200, 'body' => ['muted' => ['a', 'b']]]);
         self::assertSame(['a', 'b'], $this->client($t)->listChatMutes('c'));
-        $t = new FakeTransport(['status' => 200, 'body' => []]);
+        $t = new FakeTransport(['status' => 200, 'body' => new \stdClass()]);
         self::assertSame([], $this->client($t)->listChatMutes('c'));
     }
 
@@ -188,7 +188,7 @@ final class MethodsTest extends TestCase
             'DELETE /v1/streams/s -',
         ], $seen);
 
-        $t = new FakeTransport(['status' => 200, 'body' => []]);
+        $t = new FakeTransport(['status' => 200, 'body' => new \stdClass()]);
         self::assertSame([], $this->client($t)->listStreams());
     }
 

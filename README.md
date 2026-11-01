@@ -226,7 +226,7 @@ A tier's `cuPerParticipantSecond` is exact, so a cost is integer arithmetic:
 
 ```php
 new StreamClient(
-    baseUrl: 'https://api.voltkit.in',   // required: the controller's exact scheme and host; the key is sent here and nowhere else
+    baseUrl: 'https://api.voltkit.in',   // required: the controller's exact scheme and host; the key is sent here and nowhere else; whitespace around it is dropped
     apiKey: 'sk_...',                    // required; whitespace around it is dropped
     ratesBaseUrl: null,                  // the website API origin, for getRates(); never sent the key
     timeoutMs: 10000,                    // per attempt, from sending the request to the last byte of the reply
@@ -249,14 +249,27 @@ Named arguments are the readable way to call it; the positional order is the one
   `(retries + 1) × timeoutMs` plus the waits between attempts (about 200 ms, 400 ms, ... doubling,
   plus up to 100 ms of jitter, held at 2^31-1 ms): about 31 seconds with the defaults. In a request
   a user is waiting on, lower both: `new StreamClient(..., timeoutMs: 5000, retries: 1)`.
-- **Mistakes are caught when the client is made.** An empty `baseUrl` or `apiKey`; a `baseUrl` or
-  `ratesBaseUrl` that is not an absolute `https://` or `http://` URL naming a host (given
-  `api.voltkit.in` without a scheme, curl would guess `http://` and send the key in clear text);
-  a key that is only whitespace, a key holding a character no HTTP header can carry (a line break
-  or a NUL inside it, another control character, anything above U+00FF) or one no VoltKit key has
-  (a backslash, an accented letter): each throws `\InvalidArgumentException`. A `timeoutMs` of 0 or
-  below or negative `retries` throws `\RangeException`; a non-integer is refused by PHP's own type
-  check. None of these messages quotes the key or the URL.
+- **Mistakes are caught when the client is made.** Whitespace around `baseUrl` and `ratesBaseUrl`
+  (spaces, tabs, a line break: a line read from a file) and then one trailing `/` are dropped, as
+  for the key. What is left must be a URL a request can use, or the constructor throws
+  `\InvalidArgumentException` saying what is wrong (0.1.2; until then such a URL made a client whose
+  every call failed as a retried `network` error): an absolute `https://` or `http://` URL (given
+  `api.voltkit.in` without a scheme, curl would guess `http://` and send the key in clear text),
+  naming a host (letters, digits, `-`, `.`, `_`, `~`, or a bracketed IPv6 address) and a port only as
+  a number from 1 to 65535, with no query or fragment, and nothing but printable ASCII: no
+  whitespace inside, no control character, no backslash, no character outside ASCII (percent-encode
+  it, or give an international host in its `xn--` form). A path prefix is fine. Credentials in the
+  URL (`https://user:pass@host`) are sent by curl as Basic credentials, so they are accepted; curl
+  takes the first `@` for the end of them, so with the curl transport an `@` inside a name or
+  password must be written `%40`, and a raw one is refused. An empty `baseUrl` or `apiKey`, or a
+  `baseUrl` with nothing left, throws the same; a `ratesBaseUrl` with nothing left (`""`, `"/"`,
+  whitespace) counts as unset. A key that is only whitespace, a key holding a character no HTTP
+  header can carry (a line break or a NUL inside it, another control character, anything above
+  U+00FF) or one no VoltKit key has (a backslash, an accented letter) throws too. A `timeoutMs` of 0
+  or below or negative `retries` throws `\RangeException`; a non-integer is refused by PHP's own
+  type check. None of these messages quotes the key or any part of a URL, and with
+  `zend.exception_ignore_args` off their stack traces hold neither (both are
+  `#[\SensitiveParameter]`).
 - **Reply size.** A reply is read up to 4 MiB (`StreamClient::MAX_REPLY_BYTES`) and no further, on a
   2xx and on an error status alike: the curl transport stops reading one byte past it, and does not
   read a body whose `Content-Length` says more. A reply under that holding more than 100,000 objects
@@ -285,7 +298,7 @@ $transport = new CurlTransport([CURLOPT_PROXY => 'http://proxy.internal:3128', C
 // Any PSR-18 client with PSR-17 factories (composer require psr/http-client psr/http-factory and an implementation).
 $transport = new Psr18Transport(new \GuzzleHttp\Client(['timeout' => 10]), $psr17Factory, $psr17Factory);
 $transport = new Psr18Transport(
-    new \Symfony\Component\HttpClient\Psr18Client(\Symfony\Component\HttpClient\HttpClient::create(['max_redirects' => 0, 'timeout' => 10])),
+    new \Symfony\Component\HttpClient\Psr18Client(\Symfony\Component\HttpClient\HttpClient::create(['timeout' => 10])),
     $psr17Factory,
     $psr17Factory,
 );
@@ -294,12 +307,16 @@ $rtc = new StreamClient(baseUrl: ..., apiKey: ..., transport: $transport);
 ```
 
 The curl transport's `CURLOPT_TIMEOUT_MS` covers the whole exchange and it never follows a
-redirect on a request that carries the key; options you pass that would change that are
-overridden. A PSR-18 client decides those two things itself, so configure it (checked with Guzzle 7
-and Symfony HttpClient 7): **redirects off**, which Guzzle's PSR-18 `sendRequest()` already is,
-while Symfony's `Psr18Client` follows up to 20 by default and would hand the key to the redirect
-target, so build it with `max_redirects => 0` as above; and a **total timeout** covering the reply
-(Guzzle: `timeout`, of which it has none by default), ideally the same value as `timeoutMs`. A
+redirect on a request that carries the key (it does not even read the redirect's body); options
+you pass that would change that are overridden. A PSR-18 client decides those two things itself.
+**Redirects:** a client that follows one has already sent `X-API-Key` to the host it named before
+the SDK sees the answer. Symfony's `Psr18Client` and `HttplugClient` follow up to 20 by default
+and keep every header but `Authorization` and `Cookie` across hosts, so for a request carrying the
+key the adapter sends through their `withOptions(['max_redirects' => 0])` copy (Symfony 6.2 and
+later; 0.1.2), and `getRates()` through the client as you built it. Guzzle's PSR-18
+`sendRequest()` never follows. **Any other PSR-18 client must be built not to follow redirects**:
+the adapter cannot tell. **A total timeout** covering the reply is yours to set too (Guzzle:
+`timeout`, of which it has none by default), ideally the same value as `timeoutMs`. A
 `Request` is a credential: it carries the real `X-API-Key` for the transport, and the URL as given.
 `print_r`, `var_dump` and `json_encode` of one show the key and any URL password as `[redacted]`;
 a dumper that reads properties (Laravel's `dd()`) shows them as they are, so never dump or log a
@@ -377,7 +394,7 @@ to repeat; `createRoom`, `createStream` and `sendMessage` are [sent once](#calls
 | `chat-disabled` | 404 | no | Chat is not available on this deployment |
 | `room-exists` | 409 | no | The id is taken. Use `ensureRoom`, or another id |
 | `stream-exists` | 409 | no | The id is taken. Use the existing stream, or another id |
-| `bad-request` | 400 | no | Fix the call: the message names the field. With status 0, the SDK refused an id of `""`, `"."` or `".."` before sending |
+| `bad-request` | 400 | no | Fix the call: the message names the field. With status 0, the SDK refused an id of `""`, `"."` or `".."` before sending. An id is a `string`: PHP itself refuses `null`, an array or an object with a `\TypeError` before anything is sent, and a file with `declare(strict_types=1)` a number or a boolean too. A file without it gets PHP's conversion: `42` is sent as `42`, `false` is `""` and refused, and `true` is `"1"`, a valid id: declare strict types where your ids come from |
 | `bad-role` | 400 | no | The role is not host, cohost, moderator or viewer |
 | `bad-signature` | 401 | no | From `Webhooks::parse`: the delivery did not verify. Answer 401; VoltKit retries |
 | `rate-limited` | 429 | yes | Your project's API rate limit (600 calls a minute by default). Slow down; spread the calls |
@@ -391,7 +408,7 @@ to repeat; `createRoom`, `createStream` and `sendMessage` are [sent once](#calls
 | `network` | 0 | yes | No reply: DNS, a refused or dropped connection, the timeout, a body that broke off. Try again later; if it persists, check your server's outbound network |
 | `rates-unconfigured` | 0 | no | `getRates()` without `ratesBaseUrl`. Pass the website API origin |
 | `redirected` | 3xx | no | `baseUrl` redirects. Fix it: see [Redirects are never followed](#redirects-are-never-followed) |
-| `http-<status>` | that status | 429 and 5xx | A reply that named no code: a proxy's error page, a 2xx that is not JSON, or a reply past the size limits ("the reply is too large", see [Configuration](#configuration)). Check `baseUrl` and anything between your server and VoltKit |
+| `http-<status>` | that status | 429 and 5xx | A reply that named no code: a proxy's error page, a 2xx that is not JSON, a 2xx that is not what the call needs ("the reply is not the expected shape": no `token` from `createToken`, a list where an object belongs; 0.1.2), or a reply past the size limits ("the reply is too large", see [Configuration](#configuration)). Check `baseUrl` and anything between your server and VoltKit |
 | `RATE_LIMITED`, `NOT_FOUND`, ... | | per status | The website API's own codes, from `getRates()`, passed through |
 
 When an error reaches you with `isRetryable()` true, the SDK has already spent its retries. Try
@@ -421,7 +438,7 @@ means a `network` failure (no answer, a dropped connection, the timeout, a body 
 429, or a 5xx other than `billing-unavailable`. The waits are about 200 ms, 400 ms, 800 ms, doubling,
 plus up to 100 ms at random, so a fleet of servers does not retry in step. Not retried: any other
 4xx (the service made a decision and will make it again), `billing-unavailable`, `redirected`, a
-2xx that is not JSON, and every error raised before sending.
+2xx that is not JSON or not what the call needs, and every error raised before sending.
 
 ### Calls that are never repeated
 
@@ -520,8 +537,11 @@ credentials as `[redacted]` and no part of the key; `serialize($rtc)` and `unser
 `\LogicException` (`__serialize`, `__unserialize`), since a serialized client would carry the key.
 Requests still go to the URLs as given, credentials included. The arguments a stack trace records
 (with `zend.exception_ignore_args` off) hold neither the service's reply, nor the transport's error,
-nor an origin: a `StreamError` is built after those have been redacted and dropped, so
-`serialize($e)` and an error reporter that renders arguments see what the message shows. Anyone with
+nor an origin: a `StreamError` is built after those have been redacted and dropped, so an error
+reporter that renders arguments sees what the message shows. The constructor's `baseUrl`,
+`ratesBaseUrl` and `apiKey`, and every parameter a URL or the key passes through on the way to a
+refusal, are `#[\SensitiveParameter]`: a trace shows them as `SensitiveParameterValue`, which PHP
+refuses to `serialize()`. Anyone with
 your source and your environment can still read the secret: keep it in the environment or a secrets
 manager, never in code.
 
@@ -579,12 +599,17 @@ public function __invoke(Request $request): Response
   or anything that re-encodes: the bytes change and nothing will ever verify. A body that is not a
   string is refused with a `\TypeError`, never a quiet `false` that looks like an attack.
 - **What it checks.** The timestamp must be within `toleranceSeconds` of your clock (default 300,
-  both directions, inclusive), so a captured request cannot be replayed later; a `v1` signature must
-  match one of your secrets, compared in constant time (`hash_equals`), every secret against every
-  signature with no early return. Widen the window with
-  `Webhooks::parse($body, $header, $secrets, ['toleranceSeconds' => 600])`; `0` is allowed and
-  strict. A negative or `NAN` tolerance throws a `\RangeException`, and a string is not coerced
-  (`''` from an unset variable would be a window of nothing): pass a number.
+  both directions, inclusive), so a captured request cannot be replayed later; whole seconds are
+  compared (your clock's second against the header's), so 300.9 s old passes and `0` accepts the
+  current second. A `v1` signature must match one of your secrets, compared in constant time
+  (`hash_equals`), every secret against every signature with no early return. Widen the window with
+  `Webhooks::parse($body, $header, $secrets, ['toleranceSeconds' => 600])`. A negative or `NAN`
+  tolerance throws a `\RangeException`, and a string is not coerced (`''` from an unset variable
+  would be a window of nothing): pass a number.
+- **Secrets.** A secret that is empty or only whitespace (a blank line from a file) is no secret: it
+  never verifies anything, alone or in a list (0.1.2: HMAC took `" "` as a key, and a delivery
+  signed with it verified), and when none is left the call throws as with no secret. Whitespace
+  around real text is part of the secret: pass it exactly as the dashboard shows it.
 - **What it throws.** `StreamError` with code `bad-signature` (status 401) when the delivery does
   not verify: answer 401, and VoltKit retries at 5 s, 30 s, 2 min, 10 min and 30 min. An
   `\InvalidArgumentException` (no secret, an unknown option), a `\RangeException` or a `\TypeError`
@@ -593,7 +618,10 @@ public function __invoke(Request $request): Response
   The header may be a string, a list of strings (joined with commas) or `null`; the header grammar is
   exact: at most 4096 characters, one `t` of up to 15 digits, each `v1` exactly 64 lower-case hex
   characters, unknown schemes skipped, anything else invalid.
-- For tests, the clock is an option: `['now' => 1787000000]` or a closure returning unix seconds.
+- For tests, the clock is an option: `['now' => 1787000000]` (a fraction is fine) or a closure
+  returning unix seconds. `NAN` or an infinity throws a `\RangeException`, anything but a number an
+  `\InvalidArgumentException` (0.1.2: `NAN` switched the age check off, so a captured delivery
+  verified forever).
 
 Three things to get right: **answer first** (a slow handler is retried, so your latency becomes
 duplicate deliveries); **deduplicate on `id`** (delivery is at-least-once by design); **do not assume
@@ -678,7 +706,8 @@ behind a CDN.
 
 | Version | What changed |
 | --- | --- |
-| 0.1.1 | Prepared 2026-10-28, not published. The Music add-on in `getRates()`: `addons.music` (`price`, `cuPerParticipantSecond`, `unit`, `appliesTo`, `includedIn`, `id`, `label`; absent from an older price list); `music` is an add-on id, not a tier. A reply is read up to 4 MiB and 100,000 objects and arrays, past which it fails with `http-<status>` instead of exhausting `memory_limit` (a fatal error) in `json_decode`. The examples' 502 on an incomplete token reply and 1 MB body cap (`CHANGELOG.md`). No method changed |
+| 0.1.2 | Prepared 2026-10-31, not published. A 2xx that is not what the call needs is refused with `http-<status>`, not retried (a list never passes as an object); a bad `baseUrl` or `ratesBaseUrl` is refused when the client is made, whitespace around it dropped; neither URL in a stack trace; webhooks: whole seconds, a clock that is no finite number refused, a whitespace-only secret is none, `parse` tells `{}` from `[]`; the key's numeric HTML references with any number of leading zeros redacted, URL passwords holding `@ / ? #`; a refused redirect's body is not read; `Psr18Transport` turns redirects off on a Symfony client for requests carrying the key; the Packagist download leaves out the tests and tool configs (`CHANGELOG.md`) |
+| 0.1.1 | Published 2026-10-28. The Music add-on in `getRates()`: `addons.music` (`price`, `cuPerParticipantSecond`, `unit`, `appliesTo`, `includedIn`, `id`, `label`; absent from an older price list); `music` is an add-on id, not a tier. A reply is read up to 4 MiB and 100,000 objects and arrays, past which it fails with `http-<status>` instead of exhausting `memory_limit` (a fatal error) in `json_decode`. The examples' 502 on an incomplete token reply and 1 MB body cap (`CHANGELOG.md`). No method changed |
 | 0.1.0 | First release, to the shared server SDK specification; the same behaviour as `@voltkit-rtc/server` 0.4.8, checked against its vectors, and reviewed adversarially before release (`CHANGELOG.md`) |
 
 The package follows semver. While 0.x, a minor bump may add API; nothing public is removed or

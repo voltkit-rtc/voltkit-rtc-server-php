@@ -39,7 +39,7 @@ trait MakesClients
     }
 
     /** The StreamError a call failed with; the test fails if it resolved. */
-    protected function failure(callable $call): StreamError
+    protected function failure(#[\SensitiveParameter] callable $call): StreamError
     {
         try {
             $call();

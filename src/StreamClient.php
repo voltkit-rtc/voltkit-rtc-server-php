@@ -51,7 +51,7 @@ use VoltKit\Rtc\Transport\TransportInterface;
 final class StreamClient implements \JsonSerializable, \Stringable
 {
     /** The package version; also the version in the User-Agent. Bump with CHANGELOG.md. */
-    public const VERSION = '0.1.1';
+    public const VERSION = '0.1.2';
     /** Sent on every request, to the controller and to the rates host: nothing more identifying (spec 8). */
     public const USER_AGENT = 'voltkit-rtc-php/' . self::VERSION;
 
@@ -87,6 +87,23 @@ final class StreamClient implements \JsonSerializable, \Stringable
     private const TOO_LARGE_BYTES = 'over ' . (self::MAX_REPLY_BYTES >> 20) . ' MiB, the most this SDK reads';
     private const TOO_LARGE_CONTAINERS = 'over 100,000 objects and arrays, the most this SDK decodes';
 
+    /** What a 2xx that is not what the call needs fails with, after "<METHOD> <path>: " (spec 3.6, D4). */
+    private const NOT_THE_EXPECTED_SHAPE = 'the reply is not the expected shape: ';
+    private const NOT_AN_OBJECT = 'it is not an object';
+    /**
+     * What each typed call needs of a 2xx (spec 3.6): a JSON object and, where named, a field of that kind. `optional
+     * array` is a list call's wrapper: the key missing is an empty list, present it must be an array. Fields not
+     * named are not looked at: the wire changes additively.
+     */
+    private const AN_OBJECT = ['', ''];
+    private const WITH_TOKEN = ['token', 'non-empty string'];
+    private const WITH_ROOM_ID = ['roomId', 'non-empty string'];
+    private const WITH_ROOM = ['room', 'object'];
+    private const WITH_ROOMS = ['rooms', 'array'];
+    private const WITH_CHANNEL = ['channel', 'string'];
+    private const WITH_ID = ['id', 'non-empty string'];
+    private const WITH_STREAM_ID = ['streamId', 'non-empty string'];
+
     /** Where a message is cut, after redaction: the text of an error reply that names no message, a 2xx that is not JSON, a redirect's target. */
     public const CUT_ERROR_REPLY = 300;
     public const CUT_NOT_JSON = 100;
@@ -116,13 +133,13 @@ final class StreamClient implements \JsonSerializable, \Stringable
      * @param ?TransportInterface $transport the HTTP transport; the curl one by default (a PSR-18 adapter and test doubles exist)
      * @param ?LoggerInterface $logger a PSR-3 logger handed method, path, status, attempt and elapsed milliseconds per attempt, at debug; never a header, a body or the key
      * @param ?\Closure(int): void $sleeper how to wait between retries, given milliseconds; usleep() by default. For tests
-     * @throws \InvalidArgumentException for a missing baseUrl, a baseUrl or ratesBaseUrl that is not an absolute http(s) URL with a host, or a key that is missing, whitespace, or holds a character no header or no VoltKit key has (never quoted)
+     * @throws \InvalidArgumentException for a missing baseUrl, a baseUrl or ratesBaseUrl no request could use (not an absolute http(s) URL naming a host, a port that is no port, a query, a fragment, whitespace inside, a character outside ASCII; with the curl transport, an @ in the user info), or a key that is missing, whitespace, or holds a character no header or no VoltKit key has (neither is ever quoted)
      * @throws \RangeException for a timeoutMs of 0 or below, or negative retries
      */
     public function __construct(
-        string $baseUrl,
+        #[\SensitiveParameter] string $baseUrl,
         #[\SensitiveParameter] string $apiKey,
-        ?string $ratesBaseUrl = null,
+        #[\SensitiveParameter] ?string $ratesBaseUrl = null,
         int $timeoutMs = self::DEFAULT_TIMEOUT_MS,
         int $retries = self::DEFAULT_RETRIES,
         ?TransportInterface $transport = null,
@@ -136,15 +153,14 @@ final class StreamClient implements \JsonSerializable, \Stringable
             throw new \InvalidArgumentException('apiKey is required');
         }
         $netKey = ApiKey::net($apiKey);
-        $origin = self::httpOrigin('baseUrl', self::withoutTrailingSlash($baseUrl));
-        // Empty counts as unset, so getRates says what is missing rather than requesting a relative URL.
-        $rates = $ratesBaseUrl === null ? null : self::withoutTrailingSlash($ratesBaseUrl);
-        if ($rates === '') {
-            $rates = null;
-        }
-        if ($rates !== null) {
-            $rates = self::httpOrigin('ratesBaseUrl', $rates);
-        }
+        $transport ??= new CurlTransport();
+        // User info is a transport question: curl sends it, but not an @ inside it (spec 2.2).
+        $curl = $transport instanceof CurlTransport;
+        $origin = self::origin('baseUrl', $baseUrl, $curl) ?? throw new \InvalidArgumentException(
+            'baseUrl is required: the one given is only whitespace or a slash',
+        );
+        // Nothing left counts as unset, so getRates says what is missing rather than requesting a relative URL.
+        $rates = $ratesBaseUrl === null ? null : self::origin('ratesBaseUrl', $ratesBaseUrl, $curl);
         $this->secrets = new Secrets($netKey, $origin, $rates);
         $this->baseUrlShown = Redactor::redactUrlCredentials($origin);
         $this->ratesBaseUrlShown = $rates === null ? null : Redactor::redactUrlCredentials($rates);
@@ -156,7 +172,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
             throw new \RangeException("retries must be a whole number of 0 or more, got $retries");
         }
         $this->retries = $retries;
-        $this->transport = $transport ?? new CurlTransport();
+        $this->transport = $transport;
         $this->logger = $logger;
         $this->sleeper = $sleeper;
     }
@@ -207,7 +223,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     public function createRoom(string $hostIdentity, ?string $roomId = null, mixed $metadata = null): array
     {
         $body = ['roomId' => $roomId, 'hostIdentity' => $hostIdentity, 'metadata' => $metadata];
-        [$room] = $this->callObject('POST', '/v1/rooms', $body, safeToRepeat: false);
+        [$room] = $this->callFor('POST', '/v1/rooms', $body, false, self::WITH_ROOM_ID);
         $room['existed'] = false;
         /** @var RoomWithHostToken $room */
         return $room;
@@ -224,7 +240,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     {
         $path = '/v1/rooms/' . self::segment('roomId', $roomId);
         $body = ['hostIdentity' => $hostIdentity, 'metadata' => $metadata];
-        [$room, $status] = $this->callObject('PUT', $path, $body, safeToRepeat: true);
+        [$room, $status] = $this->callFor('PUT', $path, $body, true, self::WITH_ROOM_ID);
         $room['existed'] = $status === 200;
         /** @var RoomWithHostToken $room */
         return $room;
@@ -241,7 +257,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     {
         $path = '/v1/rooms/' . self::segment('roomId', $roomId) . '/tokens';
         $body = ['identity' => $identity, 'role' => $role instanceof Role ? $role->value : $role];
-        [$token] = $this->callObject('POST', $path, $body, safeToRepeat: true);
+        [$token] = $this->callFor('POST', $path, $body, true, self::WITH_TOKEN);
         /** @var RoomToken $token */
         return $token;
     }
@@ -255,7 +271,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     public function getRoom(string $roomId): array
     {
         $path = '/v1/rooms/' . self::segment('roomId', $roomId);
-        [$view] = $this->callObject('GET', $path, null, safeToRepeat: true);
+        [$view] = $this->callFor('GET', $path, null, true, self::WITH_ROOM);
         /** @var RoomView $view */
         return $view;
     }
@@ -267,7 +283,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
      */
     public function listRooms(): array
     {
-        [$rooms] = $this->callObject('GET', '/v1/rooms', null, safeToRepeat: true);
+        [$rooms] = $this->callFor('GET', '/v1/rooms', null, true, self::WITH_ROOMS);
         /** @var array{rooms: list<Room>, ...} $rooms */
         return $rooms;
     }
@@ -281,7 +297,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     public function listParticipants(string $roomId): array
     {
         $path = '/v1/rooms/' . self::segment('roomId', $roomId) . '/participants';
-        [$value] = $this->call('GET', $path, null, safeToRepeat: true);
+        [$value] = $this->callFor('GET', $path, null, true, ['participants', 'optional array']);
         /** @var list<Participant> */
         return self::listOf($value, 'participants');
     }
@@ -309,7 +325,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     {
         $path = '/v1/chat/' . self::segment('channel', $channel) . '/tokens';
         $body = ['identity' => $identity, 'role' => $role instanceof Role ? $role->value : $role];
-        [$token] = $this->callObject('POST', $path, $body, safeToRepeat: true);
+        [$token] = $this->callFor('POST', $path, $body, true, self::WITH_TOKEN);
         /** @var ChatToken $token */
         return $token;
     }
@@ -322,7 +338,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     public function getChatInfo(string $channel): array
     {
         $path = '/v1/chat/' . self::segment('channel', $channel);
-        [$info] = $this->callObject('GET', $path, null, safeToRepeat: true);
+        [$info] = $this->callFor('GET', $path, null, true, self::WITH_CHANNEL);
         /** @var ChatInfo $info */
         return $info;
     }
@@ -345,7 +361,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
         }
         $path = '/v1/chat/' . self::segment('channel', $channel) . '/messages'
             . ($query === [] ? '' : '?' . implode('&', $query));
-        [$value] = $this->call('GET', $path, null, safeToRepeat: true);
+        [$value] = $this->callFor('GET', $path, null, true, ['messages', 'optional array']);
         /** @var list<ChatMessage> */
         return self::listOf($value, 'messages');
     }
@@ -380,7 +396,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
             'metadata' => $metadata,
             'ephemeral' => $ephemeral,
         ];
-        [$message] = $this->callObject('POST', $path, $body, safeToRepeat: false);
+        [$message] = $this->callFor('POST', $path, $body, false, self::WITH_ID);
         /** @var ChatMessage $message */
         return $message;
     }
@@ -401,7 +417,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     public function listChatMutes(string $channel): array
     {
         $path = '/v1/chat/' . self::segment('channel', $channel) . '/mutes';
-        [$value] = $this->call('GET', $path, null, safeToRepeat: true);
+        [$value] = $this->callFor('GET', $path, null, true, ['muted', 'optional array']);
         /** @var list<string> */
         return self::listOf($value, 'muted');
     }
@@ -446,7 +462,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
             'playback' => $playback instanceof PlaybackPolicy ? $playback->value : $playback,
             'metadata' => $metadata,
         ];
-        [$stream] = $this->callObject('POST', '/v1/streams', $body, safeToRepeat: false);
+        [$stream] = $this->callFor('POST', '/v1/streams', $body, false, self::WITH_STREAM_ID);
         /** @var BroadcastStreamWithPublish $stream */
         return $stream;
     }
@@ -459,7 +475,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     public function getStream(string $streamId): array
     {
         $path = '/v1/streams/' . self::segment('streamId', $streamId);
-        [$stream] = $this->callObject('GET', $path, null, safeToRepeat: true);
+        [$stream] = $this->callFor('GET', $path, null, true, self::WITH_STREAM_ID);
         /** @var BroadcastStream $stream */
         return $stream;
     }
@@ -471,7 +487,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
      */
     public function listStreams(): array
     {
-        [$value] = $this->call('GET', '/v1/streams', null, safeToRepeat: true);
+        [$value] = $this->callFor('GET', '/v1/streams', null, true, ['streams', 'optional array']);
         /** @var list<BroadcastStream> */
         return self::listOf($value, 'streams');
     }
@@ -493,7 +509,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
             'playback' => $playback instanceof PlaybackPolicy ? $playback->value : $playback,
             'metadata' => $metadata,
         ];
-        [$stream] = $this->callObject('PATCH', $path, $body, safeToRepeat: true);
+        [$stream] = $this->callFor('PATCH', $path, $body, true, self::WITH_STREAM_ID);
         /** @var BroadcastStream $stream */
         return $stream;
     }
@@ -526,7 +542,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
             'identity' => $identity,
             'ttlSeconds' => $ttlSeconds,
         ];
-        [$token] = $this->callObject('POST', $path, $body, safeToRepeat: true);
+        [$token] = $this->callFor('POST', $path, $body, true, self::WITH_TOKEN);
         /** @var StreamToken $token */
         return $token;
     }
@@ -541,7 +557,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
      */
     public function getUsage(): array
     {
-        [$usage] = $this->callObject('GET', '/v1/usage', null, safeToRepeat: true);
+        [$usage] = $this->callFor('GET', '/v1/usage', null, true, self::AN_OBJECT);
         /** @var UsageSummary $usage */
         return $usage;
     }
@@ -555,7 +571,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     public function getUsageSeries(int $days = self::DEFAULT_USAGE_SERIES_DAYS): array
     {
         $path = '/v1/usage/series?days=' . rawurlencode((string) $days);
-        [$value] = $this->call('GET', $path, null, safeToRepeat: true);
+        [$value] = $this->callFor('GET', $path, null, true, ['series', 'optional array']);
         /** @var list<DailyUsage> */
         return self::listOf($value, 'series');
     }
@@ -571,7 +587,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
      */
     public function getBalance(): array
     {
-        [$balance] = $this->callObject('GET', '/v1/billing/balance', null, safeToRepeat: true);
+        [$balance] = $this->callFor('GET', '/v1/billing/balance', null, true, self::AN_OBJECT);
         /** @var ProjectBalance $balance */
         return $balance;
     }
@@ -675,7 +691,8 @@ final class StreamClient implements \JsonSerializable, \Stringable
      * @param bool $safeToRepeat whether repeating is harmless: decided per method, not per verb
      * @param bool $goneIsDone a delete: a 404 on a retry after an attempt that may have landed means done
      * @param bool $public send to ratesBaseUrl with no key (the public rates); false means the controller, with the key
-     * @param bool $object the method is typed to return a JSON object: any other 2xx value is http-<status>
+     * @param ?array{0: string, 1: string} $shape what a 2xx must be (a typed call's constant, spec 3.6), or null for
+     *   any JSON or an empty body (the deletes, the mutes, the rates' own check)
      * @return array{0: mixed, 1: int} the decoded value (null for an empty 2xx) and the status
      */
     private function call(
@@ -685,7 +702,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
         bool $safeToRepeat,
         bool $goneIsDone = false,
         bool $public = false,
-        bool $object = false,
+        ?array $shape = null,
     ): array {
         // Once, before anything is sent: a body JSON cannot carry is the caller's to fix, and no attempt would go
         // differently.
@@ -703,7 +720,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
                 $this->sleep($wait + random_int(0, self::BACKOFF_JITTER_MAX_MS));
             }
             try {
-                return $this->once($method, $path, $encoded, $public, $object, $attempt);
+                return $this->once($method, $path, $encoded, $public, $shape, $attempt);
             } catch (StreamError $e) {
                 if ($goneIsDone && $mayHaveLanded && self::isGone($e)) {
                     // The earlier attempt deleted it; this one finds it gone.
@@ -723,16 +740,17 @@ final class StreamClient implements \JsonSerializable, \Stringable
     }
 
     /**
-     * call() for a method typed to return a JSON object: the value, narrowed.
+     * call() for a typed method: the reply checked against `$shape` (spec 3.6) and narrowed to the array it decodes to.
      *
      * @param ?array<string, mixed> $body
+     * @param array{0: string, 1: string} $shape
      * @return array{0: array<string, mixed>, 1: int}
      */
-    private function callObject(string $method, string $path, ?array $body, bool $safeToRepeat): array
+    private function callFor(string $method, string $path, ?array $body, bool $safeToRepeat, array $shape): array
     {
-        [$value, $status] = $this->call($method, $path, $body, $safeToRepeat, object: true);
+        [$value, $status] = $this->call($method, $path, $body, $safeToRepeat, shape: $shape);
         if (!is_array($value)) {
-            throw new \LogicException('call(object: true) let a reply through that is not a JSON object');
+            throw new \LogicException('a reply that is not a JSON object passed the shape check');
         }
         /** @var array<string, mixed> $value */
         return [$value, $status];
@@ -741,9 +759,10 @@ final class StreamClient implements \JsonSerializable, \Stringable
     /**
      * One attempt. The key is attached here and only here, and only for the controller.
      *
+     * @param ?array{0: string, 1: string} $shape
      * @return array{0: mixed, 1: int}
      */
-    private function once(string $method, string $path, ?string $body, bool $public, bool $object, int $attempt): array
+    private function once(string $method, string $path, ?string $body, bool $public, ?array $shape, int $attempt): array
     {
         $withKey = !$public;
         $headers = [];
@@ -803,7 +822,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
                     $status >= 500 || $status === 429,
                 );
             }
-            $decoded = $this->decodeReply($method, $path, $status, $response->body, $object);
+            $decoded = $this->decodeReply($method, $path, $status, $response->body, $shape);
             if ($decoded['error'] !== null) {
                 [$code, $message, $retryable] = $decoded['error'];
                 throw new StreamError($code, $status, $message, $retryable);
@@ -826,7 +845,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
      * braces is "not JSON", as before. A `{` or `[` inside a string counts too, so the count errs on the safe side.
      * This returns rather than throws, so that the raw text is in no frame's arguments when the error is made.
      */
-    private static function tooLarge(string $text): ?string
+    private static function tooLarge(#[\SensitiveParameter] string $text): ?string
     {
         if (strlen($text) > self::MAX_REPLY_BYTES) {
             return self::TOO_LARGE_BYTES;
@@ -842,7 +861,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     }
 
     /** What a network error says after "<METHOD> <path>: ": the timeout in ms, or the transport's words redacted. */
-    private function networkReason(\Throwable $e): string
+    private function networkReason(#[\SensitiveParameter] \Throwable $e): string
     {
         return $e instanceof TransportException && $e->timedOut
             ? "timed out after {$this->timeoutMs}ms"
@@ -853,15 +872,18 @@ final class StreamClient implements \JsonSerializable, \Stringable
      * A whole reply, read: the value on a 2xx, else what the StreamError must say. The server's words go through
      * redaction before they reach a message, and before they are cut short, so a cut cannot leave part of the key
      * behind (spec 3.6). This returns rather than throws, so that the raw text is in no frame's arguments when the
-     * error is made.
+     * error is made, and the text is a sensitive parameter besides.
      *
-     * @param bool $object a 2xx must decode to a JSON object (a method typed to return one); Node hands any JSON
-     *   value back, a method typed to return an array cannot (a decision beyond the spec; the API never answers
-     *   otherwise)
+     * @param ?array{0: string, 1: string} $shape what a 2xx must be, or null for any JSON or nothing
      * @return array{value: mixed, error: ?array{0: string, 1: string, 2: bool}} the value, or [code, message, retryable]
      */
-    private function decodeReply(string $method, string $path, int $status, string $text, bool $object): array
-    {
+    private function decodeReply(
+        string $method,
+        string $path,
+        int $status,
+        #[\SensitiveParameter] string $text,
+        ?array $shape,
+    ): array {
         if ($status < 200 || $status >= 300) {
             [$code, $message] = self::errorFields($text);
             // Redacted too: a server answering {"error": "Invalid API key: <key>"} put the key in the code, the
@@ -875,26 +897,63 @@ final class StreamClient implements \JsonSerializable, \Stringable
             $retryable = ($status >= 500 || $status === 429) && $code !== 'billing-unavailable';
             return ['value' => null, 'error' => [$code, "$method $path: $message", $retryable]];
         }
-        if ($text === '' && !$object) {
-            return ['value' => null, 'error' => null];
-        }
         try {
+            // A success that is not what the call needs came from something other than the API too (X-1, D4): {} was
+            // a token and, with existed added, a room. Refused in this SDK's own words, which quote nothing of it.
+            // Checked first, on a decoding of its own that is gone before the value is decoded: both at once would
+            // need twice the memory, and a reply under the caps then ran past PHP's default memory_limit.
+            if ($shape !== null) {
+                $problem = $text === '' ? self::NOT_AN_OBJECT : self::shapeProblem($text, $shape);
+                if ($problem !== null) {
+                    $message = "$method $path: " . self::NOT_THE_EXPECTED_SHAPE . $problem;
+                    return ['value' => null, 'error' => ["http-$status", $message, false]];
+                }
+            }
             $value = $text === '' ? null : json_decode($text, true, 512, JSON_THROW_ON_ERROR);
+            return ['value' => $value, 'error' => null];
         } catch (\JsonException) {
-            // A success that is not JSON came from something other than the API, a web page or a proxy, and a
-            // retry would fetch the same thing.
-            return ['value' => null, 'error' => [
-                "http-$status",
-                "$method $path: the reply is not JSON: " . self::cut($this->secrets->redact($text), self::CUT_NOT_JSON),
-                false,
-            ]];
-        }
-        if ($object && !is_array($value)) {
-            $shown = self::cut($this->secrets->redact($text), self::CUT_NOT_JSON);
-            $message = "$method $path: the reply is not a JSON object: $shown";
+            // A success that is not JSON came from something other than the API, a web page or a proxy, and a retry
+            // would fetch the same thing.
+            $message = "$method $path: the reply is not JSON: ";
+            $message .= self::cut($this->secrets->redact($text), self::CUT_NOT_JSON);
             return ['value' => null, 'error' => ["http-$status", $message, false]];
         }
-        return ['value' => $value, 'error' => null];
+    }
+
+    /**
+     * What is wrong with a 2xx `$text` for a call that needs `$shape`, or null (spec 3.6); a \JsonException when it is
+     * not JSON.
+     *
+     * An object is told from a list by the JSON itself (PHP011-1): json_decode() to arrays makes {} and [] the same
+     * empty array and {"0":1} a list, so this decodes with objects kept as objects, a list being a PHP list and an
+     * object a \stdClass. That decoder alone refuses a property name that starts with a NUL, which an unknown field
+     * may have: in this copy, which nothing else reads, such a name starts with U+0001 instead. Valid or not, the
+     * JSON is the same.
+     *
+     * @param array{0: string, 1: string} $shape
+     * @throws \JsonException
+     */
+    private static function shapeProblem(#[\SensitiveParameter] string $text, array $shape): ?string
+    {
+        $value = json_decode(str_replace('"\\u0000', '"\\u0001', $text), false, 512, JSON_THROW_ON_ERROR);
+        if (!$value instanceof \stdClass) {
+            return self::NOT_AN_OBJECT;
+        }
+        [$key, $kind] = $shape;
+        if ($key === '') {
+            return null;
+        }
+        $present = property_exists($value, $key);
+        $field = $present ? $value->$key : null;
+        [$ok, $words] = match ($kind) {
+            'non-empty string' => [is_string($field) && $field !== '', 'a non-empty string'],
+            'string' => [is_string($field), 'a string'],
+            'object' => [$field instanceof \stdClass, 'an object'],
+            'array' => [is_array($field), 'an array'],
+            'optional array' => [!$present || is_array($field), 'an array'],
+            default => throw new \LogicException("no reply shape $kind"),
+        };
+        return $ok ? null : "\"$key\" is not $words";
     }
 
     /**
@@ -904,7 +963,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
      *
      * @return array{0: ?string, 1: ?string}
      */
-    private static function errorFields(string $text): array
+    private static function errorFields(#[\SensitiveParameter] string $text): array
     {
         try {
             $body = json_decode($text, true, 512, JSON_THROW_ON_ERROR);
@@ -1000,30 +1059,84 @@ final class StreamClient implements \JsonSerializable, \Stringable
         return mb_substr($text, 0, $characters, 'UTF-8');
     }
 
-    private static function withoutTrailingSlash(string $url): string
+    /**
+     * `$url` as requests will use it, whitespace at both ends (space, tab, CR, LF) and then one trailing slash dropped,
+     * as for the key: a line read from a file works. Null when nothing is left. Or an \InvalidArgumentException now,
+     * naming the option and saying what is wrong, never quoting the URL, which may hold credentials, and with no cause
+     * attached (spec 2.2; D8, PHP011-4). A URL no request could use passed here and then failed every call as a
+     * retried network error, far from the mistake; and given "api.voltkit.in" or "127.0.0.1:8080", curl guessed
+     * http:// and sent the API key in clear text (review 2026-10-23). `$url` is a sensitive parameter in every frame
+     * on the way (PHP011-2): with zend.exception_ignore_args off, a trace keeps each frame's arguments.
+     *
+     * @param bool $curl whether the curl transport will send it: curl cannot send an @ inside the user info
+     */
+    private static function origin(string $option, #[\SensitiveParameter] string $url, bool $curl): ?string
     {
-        return str_ends_with($url, '/') ? substr($url, 0, -1) : $url;
+        $origin = trim($url, ApiKey::WHITESPACE_AROUND);
+        if (str_ends_with($origin, '/')) {
+            $origin = substr($origin, 0, -1);
+        }
+        if ($origin === '') {
+            return null;
+        }
+        $problem = self::originProblem($origin, $curl);
+        if ($problem !== null) {
+            throw new \InvalidArgumentException("$option $problem (it is not shown here: it may hold credentials)");
+        }
+        return $origin;
+    }
+
+    /** What is wrong with `$origin` (spec 2.2, rules 2 to 7), in words that quote none of it, or null. */
+    private static function originProblem(#[\SensitiveParameter] string $origin, bool $curl): ?string
+    {
+        // Each parser reads such a URL its own way; percent-encode what is meant, or use the host's ASCII form.
+        if (preg_match('/[^\x21-\x7E]|\\\\/', $origin) === 1) {
+            return 'holds a space, a control character, a backslash or a character outside ASCII: percent-encode it'
+                . ' or take it out';
+        }
+        // Without a scheme a transport might guess one, and send the key in clear text.
+        if (preg_match('~^https?://([^/]*)~i', $origin, $m) !== 1) {
+            return 'must be an absolute http or https URL such as https://api.voltkit.in';
+        }
+        if (strpbrk($origin, '?#') !== false) {
+            return 'must not hold a query or a fragment: the API paths are appended to it';
+        }
+        $authority = $m[1];
+        $at = strrpos($authority, '@');
+        if (!self::namesAHost($at === false ? $authority : substr($authority, $at + 1))) {
+            return 'must name a host, and a port only as a number from 1 to 65535';
+        }
+        // curl takes the first @ for the end of the user info, and the rest for a host it refuses; it cannot send a
+        // NUL either. Every call would fail. Another transport gets the URL as given.
+        $userInfo = $at === false ? '' : substr($authority, 0, $at);
+        if ($curl && (str_contains($userInfo, '@') || str_contains($userInfo, '%00'))) {
+            return 'holds an @ in its user info, or a %00, which curl cannot send: write an @ in a name or password'
+                . ' as %40';
+        }
+        $parts = parse_url($origin);
+        if (!is_array($parts) || ($parts['host'] ?? '') === '') {
+            return 'is not a URL PHP can read';
+        }
+        return null;
     }
 
     /**
-     * `$url` when it is an absolute http(s) URL naming a host, else an \InvalidArgumentException naming the
-     * option and never the URL (which may hold credentials). Given "api.voltkit.in" or "127.0.0.1:8080", curl
-     * guesses http:// and would send the API key in clear text; Node's fetch refuses such a URL on every call
-     * (review 2026-10-23). Nothing else is checked: a path prefix is kept, as in Node.
+     * Whether `$hostAndPort` is a host and, if any, a port from 1 to 65535: a bracketed IPv6 address, or a name of
+     * letters, digits, -, ., _ and ~, the only characters curl takes in one (a quote left from a .env file, a comma,
+     * a %: curl refused them on every call).
      */
-    private static function httpOrigin(string $option, string $url): string
+    private static function namesAHost(#[\SensitiveParameter] string $hostAndPort): bool
     {
-        $parts = parse_url($url);
-        $scheme = is_array($parts) && isset($parts['scheme']) ? strtolower($parts['scheme']) : '';
-        $host = is_array($parts) && isset($parts['host']) ? $parts['host'] : '';
-        if (($scheme !== 'https' && $scheme !== 'http') || $host === '') {
-            throw new \InvalidArgumentException(
-                "$option must be an absolute URL starting with https:// (or http:// for a controller on your own"
-                . ' network) and naming a host, exactly as the Credentials tab shows it: without a scheme the'
-                . ' transport would guess one and could send the API key over plain HTTP',
-            );
+        if (preg_match('/^(?:\[([0-9A-Fa-f:.]+)\]|[A-Za-z0-9._~-]+)(?::([0-9]+))?$/D', $hostAndPort, $m) !== 1) {
+            return false;
         }
-        return $url;
+        $ipv6 = $m[1] ?? '';
+        if ($ipv6 !== '' && filter_var($ipv6, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) === false) {
+            return false;
+        }
+        // Past PHP_INT_MAX, (int) holds the digits at PHP_INT_MAX: past 65535 either way.
+        $port = $m[2] ?? '';
+        return $port === '' || ((int) $port >= 1 && (int) $port <= 65535);
     }
 
     private function sleep(int $milliseconds): void

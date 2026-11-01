@@ -11,10 +11,11 @@ namespace VoltKit\Rtc\Internal;
  * The Node SDK compiles one regular expression that matches the key character by character
  * in every form at once. PHP's PCRE2 is built with a 2-byte link size and refuses a pattern
  * past about 30 KB, which such a pattern reaches for an ordinary key, so this class is that
- * pattern as a small matcher instead: each character of the key has a list of the literal
- * forms one escaper gives it (itself, %XX in either hex case, \uXXXX, &#NN;, &#xHH;, its
- * HTML5 names, + for a space, \" and \/ ...), and each of those run once more through every
- * standard escaper (%252F, \\\/, \&quot;, &amp;quot; ...). A match is the whole key in order,
+ * pattern as a small matcher instead: each character of the key has a list of the
+ * forms one escaper gives it (itself, %XX in either hex case, \uXXXX, &#NN; and &#xHH; with
+ * any number of leading zeros, its HTML5 names, + for a space, \" and \/ ...), and each of
+ * those run once more through every standard escaper (%252F, \\\/, \&quot;, &amp;quot;,
+ * &amp;#x005F; ...). A match is the whole key in order,
  * one form per character, found by a depth-first search in the same order the Node pattern
  * tries its alternatives, with failed (position, offset) pairs remembered so the time stays
  * linear in the text. A form never holds whitespace when the key holds none, and no form is
@@ -45,13 +46,17 @@ final class Redactor
     private const MEMO_LIMIT = 65536;
 
     /**
-     * A URL's credentials: `scheme://` and the user info after it. The user info runs to the last @
-     * before whitespace, /, ? or #, so a password holding an @ is taken out whole. A scheme starts at the
-     * first letter of a run of scheme characters: the run is anchored at a character that is not one of
-     * them, and its leading digits, + . - are kept (group 1) before the scheme (group 2).
+     * A URL's credentials: `scheme://` and the user info after it. A password may hold an @, a /, a ? or
+     * a # (N049-3, D7), so the user info is either anything with no whitespace, /, ? or # up to the last @
+     * before those; or `name:` and then something that is not a port (digits, then a /, ?, #, whitespace or
+     * the end), then anything with no whitespace, up to the last @. https://host/a@b and
+     * https://host:8080/a@b hold none; https://user:123/x@h cannot be told from a port and a path, and is
+     * shown. A scheme starts at the first letter of a run of scheme characters: the run is anchored at a
+     * character that is not one of them, and its leading digits, + . - are kept (group 1) before the
+     * scheme (group 2). Run per word, up to the word's last @ (redactUrlCredentials()).
      */
-    private const URL_CREDENTIALS =
-        '/(?<![a-z0-9+.\-])([0-9+.\-]*)([a-z][a-z0-9+.\-]*:\/\/)[^\s\/?#]*@/i';
+    private const URL_CREDENTIALS = '/(?<![a-z0-9+.\-])([0-9+.\-]*)([a-z][a-z0-9+.\-]*:\/\/)'
+        . '(?:[^\s\/?#]*@|[^\s\/?#:]*:(?!\d*(?:[\/?#\s]|$))\S*@)/i';
 
     /** The characters one-layer escapes are made of, other than letters and digits: all a second escaper changes. */
     private const ESCAPE_CHARACTERS = '%\\"&#;/+';
@@ -113,11 +118,27 @@ final class Redactor
         ) ?? self::KEY_NOT_CHECKED;
     }
 
-    /** `scheme://user:pass@host` becomes `scheme://[redacted]@host`; mailto:me@host and /a@b in a path are untouched. */
-    public static function redactUrlCredentials(string $text): string
+    /**
+     * `scheme://user:pass@host` becomes `scheme://[redacted]@host`; mailto:me@host and /a@b in a path are untouched.
+     * A match lies inside one word (a run of non-whitespace) and ends at an @, so the pattern runs over each word only
+     * up to its last @, and a word with no @ is passed over: run over a whole page, `\S*@` scans to the end of a word
+     * and back from every `name:` after a `://`, which on a long word takes minutes (spec 5.5).
+     */
+    public static function redactUrlCredentials(#[\SensitiveParameter] string $text): string
     {
-        // A failure of the engine (a backtrack limit on a huge text) must not let credentials through.
-        return preg_replace(self::URL_CREDENTIALS, '$1$2' . self::MARKER . '@', $text) ?? self::KEY_NOT_CHECKED;
+        // Each word that holds an @, whole: tried only where a word starts (the lookbehind), with possessive runs that
+        // never backtrack, so a long word costs one scan, @ or not. A failure of the engine (a backtrack limit on a
+        // huge text) must not let credentials through.
+        return preg_replace_callback(
+            '/(?<!\S)[^\s@]*+@\S*+/',
+            static function (#[\SensitiveParameter] array $m): string {
+                $word = $m[0];
+                $end = (int) strrpos($word, '@') + 1;
+                $head = preg_replace(self::URL_CREDENTIALS, '$1$2' . self::MARKER . '@', substr($word, 0, $end));
+                return $head === null ? self::KEY_NOT_CHECKED : $head . substr($word, $end);
+            },
+            $text,
+        ) ?? self::KEY_NOT_CHECKED;
     }
 
     /** @return array<string, mixed> */
@@ -150,7 +171,7 @@ final class Redactor
             $alternatives[] = $byChar[$ch];
         }
         $first = $alternatives[0];
-        return static function (string $text) use ($alternatives, $first, $keyLength): string {
+        return static function (#[\SensitiveParameter] string $text) use ($alternatives, $first, $keyLength): string {
             $len = strlen($text);
             $out = '';
             $last = 0;
@@ -205,7 +226,7 @@ final class Redactor
      * @param array<int, true> $failed
      */
     private static function matchFrom(
-        string $text,
+        #[\SensitiveParameter] string $text,
         int $len,
         array $alternatives,
         int $keyLength,
@@ -231,10 +252,14 @@ final class Redactor
                 if (substr_compare($text, $exact, $pos, $flen) !== 0) {
                     continue;
                 }
-            } elseif (!self::matchesWithCase($text, $pos, $exact, $mask, $flen)) {
-                continue;
+                $next = $pos + $flen;
+            } else {
+                $next = self::matchesWithMask($text, $len, $pos, $exact, $mask);
+                if ($next < 0) {
+                    continue;
+                }
             }
-            $end = self::matchFrom($text, $len, $alternatives, $keyLength, $i + 1, $pos + $flen, $failed);
+            $end = self::matchFrom($text, $len, $alternatives, $keyLength, $i + 1, $next, $failed);
             if ($end >= 0) {
                 return $end;
             }
@@ -243,70 +268,106 @@ final class Redactor
         return -1;
     }
 
-    /** `$exact` (lower-cased where `$mask` says a hex digit or the x of &#x may be either case) at `$pos`. */
-    private static function matchesWithCase(string $text, int $pos, string $exact, string $mask, int $flen): bool
-    {
-        for ($j = 0; $j < $flen; $j++) {
-            $c = $text[$pos + $j];
-            if ($mask[$j] === '1') {
-                if (strtolower($c) !== $exact[$j]) {
-                    return false;
-                }
-            } elseif ($c !== $exact[$j]) {
-                return false;
+    /**
+     * Where `$exact` ends when it is at `$pos`, or -1. `$mask` says, per character: 0 exact; 1 either case (a hex digit,
+     * the x of &#x), `$exact` holding it lower-cased; 2 a run of zeros, none or any number (N049-5: a reference's
+     * leading zeros), taken whole. A run of zeros is always followed by a digit that is not one (the code of a
+     * character a key holds), so taking it whole is the only way it can match.
+     */
+    private static function matchesWithMask(
+        #[\SensitiveParameter] string $text,
+        int $len,
+        int $pos,
+        string $exact,
+        string $mask,
+    ): int {
+        $p = $pos;
+        $n = strlen($exact);
+        for ($j = 0; $j < $n; $j++) {
+            if ($mask[$j] === '2') {
+                $p += strspn($text, '0', $p);
+                continue;
             }
+            if ($p >= $len) {
+                return -1;
+            }
+            $c = $text[$p];
+            if ($mask[$j] === '1' ? strtolower($c) !== $exact[$j] : $c !== $exact[$j]) {
+                return -1;
+            }
+            $p++;
         }
-        return true;
+        return $p;
     }
 
     // --- the forms ----------------------------------------------------------------------------------------------------
     //
-    // A piece is one character of a form: [the character, whether either case matches]. Either-case pieces are the
-    // hex digits of %XX, \uXXXX and &#xHH;, and the x of &#x; everything else is exact.
+    // A piece is one character of a form: [the character, how it matches]. EXACT is the character itself; EITHER_CASE
+    // the hex digits of %XX, \uXXXX and &#xHH;, and the x of &#x; ZEROS any number of zeros, none included, the
+    // leading zeros of a numeric HTML reference (&#x005F;, &#0095;: N049-5). No escaper changes a zero, so the zeros of
+    // a reference escaped once more (&amp;#x005F;, %26%23x005F%3B) are matched the same way.
 
-    /** @return list<array{0: string, 1: bool}> */
+    private const EXACT = 0;
+    private const EITHER_CASE = 1;
+    private const ZEROS = 2;
+
+    /** @return list<array{0: string, 1: int}> */
     private static function pieces(string $text): array
     {
         $out = [];
         foreach (str_split($text) as $ch) {
-            $out[] = [$ch, false];
+            $out[] = [$ch, self::EXACT];
         }
         return $out;
     }
 
-    /** @return list<array{0: string, 1: bool}> */
+    /** @return list<array{0: string, 1: int}> */
     private static function hexPieces(int $code, int $width): array
     {
         $out = [];
         foreach (str_split(str_pad(strtoupper(dechex($code)), $width, '0', STR_PAD_LEFT)) as $digit) {
-            $out[] = [$digit, ctype_alpha($digit)];
+            $out[] = [$digit, ctype_alpha($digit) ? self::EITHER_CASE : self::EXACT];
         }
         return $out;
     }
 
-    /** @return list<array{0: string, 1: bool}> */
+    /** @return list<array{0: string, 1: int}> */
     private static function percentOf(int $code): array
     {
         return [...self::pieces('%'), ...self::hexPieces($code, 2)];
     }
 
-    /** @return list<array{0: string, 1: bool}> */
+    /**
+     * &#x, any zeros, the hex digits in either case, and ;
+     *
+     * @return list<array{0: string, 1: int}>
+     */
     private static function hexReferenceOf(int $code): array
     {
-        return [...self::pieces('&#'), ['x', true], ...self::hexPieces($code, 1), ...self::pieces(';')];
+        return [
+            ...self::pieces('&#'),
+            ['x', self::EITHER_CASE],
+            ['0', self::ZEROS],
+            ...self::hexPieces($code, 1),
+            ...self::pieces(';'),
+        ];
     }
 
-    /** @return list<array{0: string, 1: bool}> */
-    private static function decimalReferenceOf(int $code, int $width = 1): array
+    /**
+     * &#, any zeros, the decimal digits, and ;
+     *
+     * @return list<array{0: string, 1: int}>
+     */
+    private static function decimalReferenceOf(int $code): array
     {
-        return self::pieces('&#' . str_pad((string) $code, $width, '0', STR_PAD_LEFT) . ';');
+        return [...self::pieces('&#'), ['0', self::ZEROS], ...self::pieces("$code;")];
     }
 
     /**
      * Each of `$chars` mapped to what `$encode` makes of it.
      *
-     * @param callable(string): list<array{0: string, 1: bool}> $encode
-     * @return array<string, list<array{0: string, 1: bool}>>
+     * @param callable(string): list<array{0: string, 1: int}> $encode
+     * @return array<string, list<array{0: string, 1: int}>>
      */
     private static function escaping(string $chars, callable $encode): array
     {
@@ -320,7 +381,7 @@ final class Redactor
     /**
      * The first HTML5 name of an escape character, as &name;
      *
-     * @return list<array{0: string, 1: bool}>
+     * @return list<array{0: string, 1: int}>
      */
     private static function namedReferenceOf(string $ch): array
     {
@@ -335,7 +396,7 @@ final class Redactor
      * PHP's json_encode writes / as \/. HTML: html.escape, htmlspecialchars and lodash write &quot;, Go &#34;; PHP's
      * htmlentities with ENT_HTML5 names each character, OWASP's encoders write &#x..;, others &#..;.
      *
-     * @return list<array<string, list<array{0: string, 1: bool}>>>
+     * @return list<array<string, list<array{0: string, 1: int}>>>
      */
     private static function escapers(): array
     {
@@ -357,11 +418,11 @@ final class Redactor
     }
 
     /**
-     * Every form one escaper gives `$ch`: itself; its byte as %XX in either hex case; \uXXXX; &#NN; and &#0NN; (PHP's
-     * &#039;); &#xHH; with x and digits in either case; each of its HTML5 names; + for a space; its JSON escape (\" and
-     * \t); and PHP's \/ for a slash.
+     * Every form one escaper gives `$ch`: itself; its byte as %XX in either hex case; \uXXXX; &#NN; with any number of
+     * leading zeros (PHP's &#039;, &#0095;); &#xHH; with x and digits in either case and any number of leading zeros;
+     * each of its HTML5 names; + for a space; its JSON escape (\" and \t); and PHP's \/ for a slash.
      *
-     * @return list<list<array{0: string, 1: bool}>>
+     * @return list<list<array{0: string, 1: int}>>
      */
     private static function oneLayerFormsOf(string $ch): array
     {
@@ -371,7 +432,6 @@ final class Redactor
             self::percentOf($code),
             [...self::pieces('\\u'), ...self::hexPieces($code, 4)],
             self::decimalReferenceOf($code),
-            self::decimalReferenceOf($code, 3),
             self::hexReferenceOf($code),
         ];
         foreach (self::HTML_NAMES[$ch] ?? [] as $name) {
@@ -393,10 +453,10 @@ final class Redactor
 
     /**
      * Every alternative for one character of the key: each one-layer form, as it is and run through each escaper,
-     * compiled to [the form with either-case pieces lower-cased, the either-case mask or null, the length], in the
-     * order the Node pattern lists them, without duplicates.
+     * compiled to [the form with either-case pieces lower-cased, the mask (matchesWithMask()) or null when every piece
+     * is exact, the least length it matches], in the order the Node pattern lists them, without duplicates.
      *
-     * @param list<array<string, list<array{0: string, 1: bool}>>> $escapers
+     * @param list<array<string, list<array{0: string, 1: int}>>> $escapers
      * @return list<array{0: string, 1: ?string, 2: int}>
      */
     private static function alternativesOf(string $ch, array $escapers): array
@@ -407,7 +467,7 @@ final class Redactor
             foreach ([[], ...$escapers] as $escaper) {
                 $pieces = [];
                 foreach ($form as $piece) {
-                    if (!$piece[1] && isset($escaper[$piece[0]])) {
+                    if ($piece[1] === self::EXACT && isset($escaper[$piece[0]])) {
                         foreach ($escaper[$piece[0]] as $replacement) {
                             $pieces[] = $replacement;
                         }
@@ -417,16 +477,16 @@ final class Redactor
                 }
                 $exact = '';
                 $mask = '';
-                $anyCase = false;
-                foreach ($pieces as [$c, $ci]) {
-                    $exact .= $ci ? strtolower($c) : $c;
-                    $mask .= $ci ? '1' : '0';
-                    $anyCase = $anyCase || $ci;
+                $least = 0;
+                foreach ($pieces as [$c, $how]) {
+                    $exact .= $how === self::EITHER_CASE ? strtolower($c) : $c;
+                    $mask .= (string) $how;
+                    $least += $how === self::ZEROS ? 0 : 1;
                 }
                 $id = $exact . '|' . $mask;
                 if (!isset($seen[$id])) {
                     $seen[$id] = true;
-                    $list[] = [$exact, $anyCase ? $mask : null, strlen($exact)];
+                    $list[] = [$exact, $least === strlen($mask) && !str_contains($mask, '1') ? null : $mask, $least];
                 }
             }
         }

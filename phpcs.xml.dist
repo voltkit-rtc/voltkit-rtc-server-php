@@ -8,7 +8,10 @@
     <arg name="colors"/>
     <arg value="sp"/>
     <rule ref="PSR12"/>
-    <rule ref="Generic.PHP.RequireStrictTypes"/>
+    <rule ref="Generic.PHP.RequireStrictTypes">
+        <!-- A test fixture: calls made the way a file without strict types makes them. -->
+        <exclude-pattern>tests/Support/WeakCalls.php</exclude-pattern>
+    </rule>
     <!-- A test fixture: a server script with its helpers in one file. -->
     <rule ref="PSR1.Files.SideEffects">
         <exclude-pattern>tests/Support/loopback-server.php</exclude-pattern>

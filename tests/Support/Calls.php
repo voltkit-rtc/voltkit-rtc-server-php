@@ -123,7 +123,28 @@ final class Calls
      */
     public static function withId(StreamClient $c, string $method, string $param, string $id): mixed
     {
-        $args = match ("$method/$param") {
+        return self::invoke($c, $method, self::argsWithId($method, $param, $id));
+    }
+
+    /**
+     * Call `$method` by name with `$args` as named arguments, from this strict_types file: PHP refuses an argument of
+     * another type with a TypeError before the method runs. WeakCalls::direct() is the same call from a weak-mode file.
+     *
+     * @param array<string, mixed> $args
+     */
+    public static function direct(StreamClient $c, string $method, array $args): mixed
+    {
+        return $c->$method(...$args);
+    }
+
+    /**
+     * The named arguments that put `$id` in the place `$param` of `$method`, the others the generator's.
+     *
+     * @return array<string, mixed>
+     */
+    public static function argsWithId(string $method, string $param, mixed $id): array
+    {
+        return match ("$method/$param") {
             'ensureRoom/roomId' => ['roomId' => $id, 'hostIdentity' => 'h'],
             'createToken/roomId' => ['roomId' => $id, 'identity' => 'u', 'role' => 'viewer'],
             'getRoom/roomId', 'listParticipants/roomId', 'deleteRoom/roomId' => ['roomId' => $id],
@@ -140,6 +161,5 @@ final class Calls
             'createStreamToken/streamId' => ['streamId' => $id, 'action' => 'play'],
             default => throw new \InvalidArgumentException("no id place $method/$param"),
         };
-        return self::invoke($c, $method, $args);
     }
 }

@@ -6,8 +6,10 @@ namespace VoltKit\Rtc\Tests\Unit;
 
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use VoltKit\Rtc\StreamClient;
 use VoltKit\Rtc\Tests\Support\FakeTransport;
 use VoltKit\Rtc\Tests\Support\MakesClients;
+use VoltKit\Rtc\Transport\CurlTransport;
 
 /**
  * Review 2026-10-23, finding 3 (spec 5.5): with zend.exception_ignore_args off (php.ini-development, and many
@@ -22,16 +24,21 @@ final class TraceArgumentsTest extends TestCase
     private const KEY = 'sk_8d41f0c2b97e3a65d0f1c4e7a92b5d38c6e1f04a7b29d3c58e60f1a2b4c7d9e0';
 
     private string $ignoreArgs = '1';
+    private string $stringParamMaxLen = '0';
 
     protected function setUp(): void
     {
         $this->ignoreArgs = (string) ini_get('zend.exception_ignore_args');
         self::assertNotFalse(ini_set('zend.exception_ignore_args', '0'), 'the setting is INI_ALL');
+        // PHP's own default without a php.ini (the official images): 15 characters of each string argument in (string) $e.
+        $this->stringParamMaxLen = (string) ini_get('zend.exception_string_param_max_len');
+        self::assertNotFalse(ini_set('zend.exception_string_param_max_len', '15'));
     }
 
     protected function tearDown(): void
     {
         ini_set('zend.exception_ignore_args', $this->ignoreArgs);
+        ini_set('zend.exception_string_param_max_len', $this->stringParamMaxLen);
     }
 
     /**
@@ -84,12 +91,21 @@ final class TraceArgumentsTest extends TestCase
         return implode("\n", $out);
     }
 
-    /** The SDK's frames, serialized as a job store or a session would: possible, and free of `$secret`. */
+    /**
+     * The SDK's frames, serialized as a job store or a session would: possible, and free of `$secret`. PHP refuses to
+     * serialize a #[\SensitiveParameter] value, which stands for what was passed and holds nothing else: it is
+     * written here as its class name.
+     */
     private static function assertSerializesWithout(string $secret, \Throwable $e): void
     {
         $frames = self::sdkFrames($e);
         self::assertNotEmpty($frames);
         self::assertTrue(array_key_exists('args', $frames[0]), 'the trace was recorded with arguments');
+        array_walk_recursive($frames, static function (mixed &$v): void {
+            if ($v instanceof \SensitiveParameterValue) {
+                $v = \SensitiveParameterValue::class;
+            }
+        });
         self::assertStringNotContainsString($secret, serialize($frames));
     }
 
@@ -123,6 +139,43 @@ final class TraceArgumentsTest extends TestCase
         self::assertStringNotContainsString('hunter2', self::traceText($e), 'the TransportException in the trace holds the raw words');
         self::assertSerializesWithout('hunter2', $e);
         self::assertNull($e->getPrevious(), 'and it is not attached as the previous exception');
+    }
+
+    /**
+     * PHP011-2: `new StreamClient('deploy:hunter2@x.test', ...)` showed the URL in (string) $e and in the trace's
+     * arguments, the password with it: $baseUrl, $ratesBaseUrl and the URL check's own parameter were not marked
+     * #[\SensitiveParameter]. Every frame on the way to the refusal holds the URL as a sensitive value now. (A loop,
+     * not a data provider: this test's own arguments would be in the trace too.)
+     */
+    #[Test]
+    public function aRefusedUrlIsNeitherQuotedNorATraceArgument(): void
+    {
+        $cases = [
+            'the report\'s baseUrl: no scheme' => ['deploy:hunter2@x.test', null],
+            'the same as ratesBaseUrl' => ['https://x.test', 'deploy:hunter2@x.test'],
+            'a line feed inside' => ["https://deploy:hunter2@x.test\n/v1", null],
+            'a query' => ['https://deploy:hunter2@x.test?region=eu', null],
+            'a bad port' => ['https://deploy:hunter2@x.test:0', null],
+            'a password holding a /' => ['https://deploy:hunter2/x@x.test', null],
+            'a rates URL with a bad port' => ['https://x.test', 'https://deploy:hunter2@x.test:99999'],
+            'an @ in the password, which curl cannot send' => ['https://deploy:p@hunter2@x.test', null],
+        ];
+        foreach ($cases as $name => [$baseUrl, $ratesBaseUrl]) {
+            foreach ([null, new CurlTransport()] as $transport) {
+                try {
+                    // No transport given is the curl one too.
+                    new StreamClient($baseUrl, self::KEY, $ratesBaseUrl, transport: $transport);
+                    self::fail("$name: accepted");
+                } catch (\InvalidArgumentException $e) {
+                    self::assertStringNotContainsString('hunter2', $e->getMessage(), $name);
+                    self::assertStringNotContainsString('hunter2', (string) $e, "$name: (string) \$e, as a log line shows it");
+                    self::assertStringNotContainsString('hunter2', self::traceText($e), $name);
+                    self::assertSerializesWithout('hunter2', $e);
+                    self::assertSerializesWithout(self::KEY, $e);
+                    self::assertNull($e->getPrevious(), $name);
+                }
+            }
+        }
     }
 
     #[Test]

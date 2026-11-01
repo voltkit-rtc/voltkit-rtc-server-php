@@ -28,10 +28,16 @@ final class FakeTransport implements TransportInterface
     /** @var list<array<string, mixed>> */
     private readonly array $steps;
 
-    /** @param array<string, mixed> ...$steps */
+    /**
+     * A body is sent as json_encode() writes it: an empty or list-like PHP array as a JSON list, a \stdClass as an
+     * object. The client tells the two apart (0.1.2), so a reply that must be an object is given its fields, or
+     * `new \stdClass()` for {}.
+     *
+     * @param array<string, mixed> ...$steps
+     */
     public function __construct(array ...$steps)
     {
-        $this->steps = $steps === [] ? [['status' => 200, 'body' => []]] : array_values($steps);
+        $this->steps = $steps === [] ? [['status' => 200, 'body' => new \stdClass()]] : array_values($steps);
     }
 
     /**

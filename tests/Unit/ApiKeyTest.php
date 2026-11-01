@@ -86,7 +86,7 @@ final class ApiKeyTest extends TestCase
 
     #[Test]
     #[DataProvider('refusedKeys')]
-    public function aRefusedKeyFailsTheConstructorWithoutBeingQuoted(string $key, string $prefix): void
+    public function aRefusedKeyFailsTheConstructorWithoutBeingQuoted(#[\SensitiveParameter] string $key, string $prefix): void
     {
         try {
             new StreamClient('https://x.test', $key, transport: new FakeTransport());

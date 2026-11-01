@@ -65,7 +65,7 @@ final class RequestsTest extends TestCase
     #[DataProvider('encodedIds')]
     public function everyOtherIdIsPercentEncodedLikeEncodeUriComponent(string $id, string $segment): void
     {
-        $t = new FakeTransport(['status' => 200, 'body' => []]);
+        $t = new FakeTransport(['status' => 200, 'body' => ['room' => new \stdClass()]]);
         $this->client($t)->getRoom($id);
         self::assertSame("https://x.test/v1/rooms/$segment", $t->last()->url);
     }
@@ -124,7 +124,7 @@ final class RequestsTest extends TestCase
     #[Test]
     public function callsWithoutABodySendNoneAndNoContentType(): void
     {
-        $t = new FakeTransport(['status' => 200, 'body' => []]);
+        $t = new FakeTransport(['status' => 200, 'body' => ['room' => new \stdClass()]]);
         $c = $this->client($t);
         $c->getRoom('r');
         $c->deleteRoom('r');

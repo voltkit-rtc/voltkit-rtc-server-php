@@ -54,17 +54,17 @@ final class ReplyTest extends TestCase
     #[Test]
     public function aSuccessWhoseJsonIsNotAnObjectWhereOneIsNeededFailsWithHttpStatus(): void
     {
-        // Node hands any JSON value back; a typed method here has to refuse what it cannot type (reported as a decision).
+        // Every SDK refuses it now (spec 3.6, D4), in its own words: nothing of the reply is quoted (0.1.2).
         $t = new FakeTransport(['status' => 200, 'raw' => '"a string"']);
         $e = $this->failure(fn () => $this->client($t)->getRoom('r'));
         self::assertSame('http-200', $e->getErrorCode());
         self::assertFalse($e->isRetryable());
-        self::assertSame('GET /v1/rooms/r: the reply is not a JSON object: "a string"', $e->getMessage());
+        self::assertSame('GET /v1/rooms/r: the reply is not the expected shape: it is not an object', $e->getMessage());
         self::assertSame(1, $t->attempts());
 
         $t = new FakeTransport(['status' => 200]);
         $e = $this->failure(fn () => $this->client($t)->getUsage());
-        self::assertSame('GET /v1/usage: the reply is not a JSON object: ', $e->getMessage(), 'an empty 2xx where a value is needed');
+        self::assertSame('GET /v1/usage: the reply is not the expected shape: it is not an object', $e->getMessage(), 'an empty 2xx where a value is needed');
     }
 
     #[Test]

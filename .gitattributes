@@ -1,0 +1,14 @@
+# What `composer require voltkit/rtc-server` installs. Packagist hands out GitHub's zipball of the tag, which
+# is `git archive` of this folder (the mirror's root): it honours export-ignore here and ignores
+# composer.json's archive.exclude (VK1031-11). Keep the two lists the same.
+/tests export-ignore
+/phpstan-stubs export-ignore
+/phpunit.xml.dist export-ignore
+/phpstan.neon.dist export-ignore
+/phpcs.xml.dist export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore
+/composer.lock export-ignore
+/vendor export-ignore
+/.phpunit.cache export-ignore
+/REVIEW-2026-10-23.md export-ignore

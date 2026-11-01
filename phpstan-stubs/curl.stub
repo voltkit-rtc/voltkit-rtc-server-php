@@ -1,0 +1,7 @@
+<?php
+
+// PHP 8.3's curl constants, so PHPStan can analyse both branches of CurlTransport on PHP 8.2: the code checks
+// defined('CURLOPT_PROTOCOLS_STR') first, but PHPStan reads every branch against the PHP it runs on.
+
+const CURLOPT_PROTOCOLS_STR = 10318;
+const CURLOPT_REDIR_PROTOCOLS_STR = 10319;

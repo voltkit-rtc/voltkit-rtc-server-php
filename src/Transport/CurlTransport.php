@@ -10,7 +10,8 @@ use VoltKit\Rtc\StreamClient;
  * The default transport, on ext-curl. CURLOPT_TIMEOUT_MS is one deadline for the whole
  * exchange, connect to last byte, which is what spec 3.4 asks for; CURLOPT_FOLLOWLOCATION is
  * off unless the request says it may follow (only the public rates do), so a 3xx comes back
- * as the reply and the client refuses it with `redirected` (spec 3.5). A body is read up to
+ * as the reply, its body unread and the connection closed (0.1.2), and the client refuses it with
+ * `redirected` (spec 3.5). A body is read up to
  * StreamClient::MAX_REPLY_BYTES and no further (0.1.1): one declared longer is not read at
  * all, one that streams on is cut off at the cap, and the Response says $tooLarge.
  */
@@ -42,6 +43,7 @@ final class CurlTransport implements TransportInterface
         $headers = [];
         $hopStatus = 0;
         $tooLarge = false;
+        $redirectUnread = false;
         $following = $request->followRedirects;
         // One block of headers per hop: when a redirect is followed, the final reply's headers are the ones kept.
         $onHeader = static function (
@@ -51,6 +53,7 @@ final class CurlTransport implements TransportInterface
             &$headers,
             &$hopStatus,
             &$tooLarge,
+            &$redirectUnread,
             $following,
             $max,
         ): int {
@@ -58,8 +61,15 @@ final class CurlTransport implements TransportInterface
                 $headers = [];
                 $hopStatus = (int) (explode(' ', $line, 3)[1] ?? '0');
             } elseif (trim($line) === '') {
-                // The end of a hop's headers. A body declared past the cap is refused before a byte of it is
-                // read: a callback returning less than it was handed stops the transfer.
+                // The end of a hop's headers: a callback returning less than it was handed stops the transfer, and
+                // curl closes the connection. A redirect this request does not follow is the answer, and its body
+                // is not read: read to its end, a body that stalled held the request until the deadline, which
+                // then failed as a retried network error instead of `redirected` (spec 3.5, N049-4).
+                if (!$following && $hopStatus >= 300 && $hopStatus < 400) {
+                    $redirectUnread = true;
+                    return 0;
+                }
+                // A body declared past the cap is refused before a byte of it is read.
                 if (self::declaredPastTheCap($headers, $hopStatus, $following, $max)) {
                     $tooLarge = true;
                     return 0;
@@ -133,6 +143,9 @@ final class CurlTransport implements TransportInterface
 
         $done = curl_exec($ch);
         $errno = curl_errno($ch);
+        if ($redirectUnread) {
+            return new Response($hopStatus, $headers, '');
+        }
         if ($tooLarge) {
             // Stopped on purpose at the cap: the reply's status and headers, its body unread or let go.
             $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);

@@ -55,11 +55,16 @@ final class RtcTokenController extends Controller
             if ($e->isRetryable()) {
                 return new JsonResponse(['error' => 'Try again in a moment'], 503, ['Retry-After' => '10']);
             }
+            if ($e->getStatus() >= 200 && $e->getStatus() < 300) {
+                // A 2xx that is no token (the SDK refuses one without a token, and one that is not JSON).
+                return new JsonResponse(['error' => 'The RTC service returned an incomplete token; try again'], 502);
+            }
             return new JsonResponse(['error' => 'Something went wrong'], 500);   // unauthorized, bad-role, ...: a problem on this side
         }
-        if (($token['token'] ?? '') === '' || ($token['wsUrl'] ?? '') === '') {
-            // A 200 without a usable token is no success. Logged by room, never the reply: it may hold a token.
-            Log::error('createToken returned no token or wsUrl', ['roomId' => $roomId]);
+        if (($token['wsUrl'] ?? '') === '') {
+            // The SDK checks the token; without a wsUrl there is still nothing to connect to. Logged by room, never
+            // the reply: it holds a token.
+            Log::error('createToken returned no wsUrl', ['roomId' => $roomId]);
             return new JsonResponse(['error' => 'The RTC service returned an incomplete token; try again'], 502);
         }
 
