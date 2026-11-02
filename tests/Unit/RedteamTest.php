@@ -124,15 +124,48 @@ final class RedteamTest extends TestCase
         return [
             'NaN literal' => [self::rates(self::musicWith('"price":"10.00"', '"price":NaN'))],
             'Infinity literal' => [self::rates(self::musicWith('"price":"10.00"', '"price":Infinity'))],
-            'nested 600 deep (past json_decode\'s 512)' => [
-                self::rates('{"music":' . str_repeat('[', 600) . str_repeat(']', 600) . '}'),
-            ],
             'nested 100,000 deep' => [self::rates('{"music":' . str_repeat('[', 100000) . str_repeat(']', 100000) . '}')],
             'truncated' => [substr(self::rates(self::MUSIC), 0, -40)],
             'trailing garbage' => [self::rates(self::MUSIC) . ' xx'],
             'invalid UTF-8 in a label' => [self::rates(self::musicWith('"label":"Music add-on"', "\"label\":\"Mu\xffsic\""))],
-            'a lone surrogate escape' => [self::rates(self::musicWith('"label":"Music add-on"', '"label":"\ud800"'))],
         ];
+    }
+
+    /**
+     * Replies PHP alone refused as "not JSON" before 0.1.3, pinned so here until the testers showed a chat viewer can
+     * cause both (PHP012-1), and what getRates hands back now: what Node and Go read.
+     *
+     * @return array<string, array{0: string, 1: array<string, mixed>}>
+     */
+    public static function readSinceZeroOneThree(): array
+    {
+        $deep = [];
+        for ($i = 1; $i < 600; $i++) {
+            $deep = [$deep];
+        }
+        $music = json_decode(self::MUSIC, true, 512, JSON_THROW_ON_ERROR);
+        self::assertIsArray($music);
+        return [
+            'nested 600 deep (past json_decode\'s default 512)' => [
+                self::rates('{"music":' . str_repeat('[', 600) . str_repeat(']', 600) . '}'),
+                ['music' => $deep],
+            ],
+            'a lone surrogate escape' => [
+                self::rates(self::musicWith('"label":"Music add-on"', '"label":"\ud800"')),
+                ['music' => ['label' => "\u{FFFD}"] + $music],
+            ],
+        ];
+    }
+
+    /** @param array<string, mixed> $addons */
+    #[Test]
+    #[DataProvider('readSinceZeroOneThree')]
+    public function aReplyPhpAloneRefusedReadsAsNodeAndGoReadIt(string $text, array $addons): void
+    {
+        $t = FakeTransport::raw(200, $text);
+        $got = $this->client($t, retries: 0, ratesBaseUrl: self::RATES)->getRates();
+        self::assertEquals($addons, $got['addons'] ?? null);
+        self::assertSame(1, $t->attempts());
     }
 
     #[Test]

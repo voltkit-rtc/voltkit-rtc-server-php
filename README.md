@@ -312,9 +312,12 @@ you pass that would change that are overridden. A PSR-18 client decides those tw
 **Redirects:** a client that follows one has already sent `X-API-Key` to the host it named before
 the SDK sees the answer. Symfony's `Psr18Client` and `HttplugClient` follow up to 20 by default
 and keep every header but `Authorization` and `Cookie` across hosts, so for a request carrying the
-key the adapter sends through their `withOptions(['max_redirects' => 0])` copy (Symfony 6.2 and
-later; 0.1.2), and `getRates()` through the client as you built it. Guzzle's PSR-18
-`sendRequest()` never follows. **Any other PSR-18 client must be built not to follow redirects**:
+key the adapter sends through a copy of theirs that follows none: their
+`withOptions(['max_redirects' => 0])` on Symfony 6.2 and later (0.1.2), and on 5.3 to 6.1 a clone
+whose wrapped `HttpClientInterface` is that client's own `withOptions()` copy (0.1.3; until then
+such a client was used as given, and it followed with the key). A Symfony client older than 5.3
+is refused with `\InvalidArgumentException` when the transport is made. `getRates()` goes through
+the client as you built it. Guzzle's PSR-18 `sendRequest()` never follows. **Any other PSR-18 client must be built not to follow redirects**:
 the adapter cannot tell. **A total timeout** covering the reply is yours to set too (Guzzle:
 `timeout`, of which it has none by default), ideally the same value as `timeoutMs`. A
 `Request` is a credential: it carries the real `X-API-Key` for the transport, and the URL as given.
@@ -614,6 +617,10 @@ public function __invoke(Request $request): Response
   not verify: answer 401, and VoltKit retries at 5 s, 30 s, 2 min, 10 min and 30 min. An
   `\InvalidArgumentException` (no secret, an unknown option), a `\RangeException` or a `\TypeError`
   is a mistake in your setup: let it reach your error handler.
+  A `\JsonException` or an `\UnexpectedValueException` is a body that verified but that PHP cannot
+  read, or that is not a JSON object: never from VoltKit (0.1.3: a lone surrogate escape in a chat
+  message reads as U+FFFD and nesting up to about 5,000 levels reads, as in Node and Go; until then
+  both made `parse` throw past the catch above, and the receiver answered a real delivery with a 500).
 - **`Webhooks::verify`** takes the same arguments and returns `true` or `false` instead of the event.
   The header may be a string, a list of strings (joined with commas) or `null`; the header grammar is
   exact: at most 4096 characters, one `t` of up to 15 digits, each `v1` exactly 64 lower-case hex
@@ -706,7 +713,8 @@ behind a CDN.
 
 | Version | What changed |
 | --- | --- |
-| 0.1.2 | Prepared 2026-10-31, not published. A 2xx that is not what the call needs is refused with `http-<status>`, not retried (a list never passes as an object); a bad `baseUrl` or `ratesBaseUrl` is refused when the client is made, whitespace around it dropped; neither URL in a stack trace; webhooks: whole seconds, a clock that is no finite number refused, a whitespace-only secret is none, `parse` tells `{}` from `[]`; the key's numeric HTML references with any number of leading zeros redacted, URL passwords holding `@ / ? #`; a refused redirect's body is not read; `Psr18Transport` turns redirects off on a Symfony client for requests carrying the key; the Packagist download leaves out the tests and tool configs (`CHANGELOG.md`) |
+| 0.1.3 | Prepared 2026-11-02, not published. A reply or a verified webhook body that PHP alone refused reads as in Node and Go: a lone UTF-16 surrogate escape (a viewer's chat message) as U+FFFD, and nesting up to about 5,000 levels (metadata), where `listMessages`, `getRoom` and `listParticipants` failed with `http-200 the reply is not JSON` and `Webhooks::parse` threw a raw `\JsonException` past the example receiver's catch; valid text is never changed and the signature is still checked on the raw bytes; `Psr18Transport` keeps the key home on Symfony 5.3 to 6.1 too and refuses an older Symfony client when it is made; the suite runs with `zend.assertions=1` (`CHANGELOG.md`) |
+| 0.1.2 | Published 2026-11-01. A 2xx that is not what the call needs is refused with `http-<status>`, not retried (a list never passes as an object); a bad `baseUrl` or `ratesBaseUrl` is refused when the client is made, whitespace around it dropped; neither URL in a stack trace; webhooks: whole seconds, a clock that is no finite number refused, a whitespace-only secret is none, `parse` tells `{}` from `[]`; the key's numeric HTML references with any number of leading zeros redacted, URL passwords holding `@ / ? #`; a refused redirect's body is not read; `Psr18Transport` turns redirects off on a Symfony client for requests carrying the key; the Packagist download leaves out the tests and tool configs (`CHANGELOG.md`) |
 | 0.1.1 | Published 2026-10-28. The Music add-on in `getRates()`: `addons.music` (`price`, `cuPerParticipantSecond`, `unit`, `appliesTo`, `includedIn`, `id`, `label`; absent from an older price list); `music` is an add-on id, not a tier. A reply is read up to 4 MiB and 100,000 objects and arrays, past which it fails with `http-<status>` instead of exhausting `memory_limit` (a fatal error) in `json_decode`. The examples' 502 on an incomplete token reply and 1 MB body cap (`CHANGELOG.md`). No method changed |
 | 0.1.0 | First release, to the shared server SDK specification; the same behaviour as `@voltkit-rtc/server` 0.4.8, checked against its vectors, and reviewed adversarially before release (`CHANGELOG.md`) |
 

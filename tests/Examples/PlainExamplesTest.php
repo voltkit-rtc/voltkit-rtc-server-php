@@ -144,6 +144,20 @@ final class PlainExamplesTest extends TestCase
         self::assertSame(401, $status);
     }
 
+    #[Test]
+    public function theWebhookReceiverAnswers200ToADeliveryWithALoneSurrogateOrDeepNesting(): void
+    {
+        // PHP012-1: a viewer's chat message with a lone surrogate escape, or nested 600 deep, reaches a chat.message
+        // delivery; Webhooks::parse read neither, threw a raw \JsonException past the example's documented catch, and
+        // the receiver answered a real delivery with a fatal and a 500, which VoltKit retries for about 40 minutes.
+        foreach (['"\ud83d"', str_repeat('[', 600) . str_repeat(']', 600)] as $text) {
+            $id = self::$deliveredIds[] = 'evt_' . bin2hex(random_bytes(8));
+            $body = '{"id":"' . $id . '","type":"chat.message","tenantId":"t","createdAt":1787000000000,"data":{"text":' . $text . '}}';
+            [$status, $reply] = self::deliver($body, 'whsec_test', false);
+            self::assertSame(200, $status, $reply);
+        }
+    }
+
     /** {"roomId":"show-42","pad":"xx..."}, exactly $size bytes. */
     private static function tokenRequest(int $size): string
     {

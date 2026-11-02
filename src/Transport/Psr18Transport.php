@@ -21,9 +21,14 @@ use VoltKit\Rtc\StreamClient;
  * gives the adapter no say. Symfony's Psr18Client and HttplugClient follow up to 20 by default and
  * keep every header but Authorization and Cookie across hosts (the testers' report of 2026-10-31:
  * the key reached the other host), so for a request carrying the key this adapter sends through
- * their withOptions(['max_redirects' => 0]) copy (Symfony 6.2 and later; 0.1.2), and the public
- * rates through the client as given. Guzzle's sendRequest() never follows (its PSR-18 path forces
- * `allow_redirects` off). Any other client must be built not to follow: check yours.
+ * a copy of theirs that follows none: their withOptions(['max_redirects' => 0]) on Symfony 6.2 and
+ * later (0.1.2), and before 6.2 a clone whose wrapped HttpClientInterface is that client's own
+ * withOptions() copy (Symfony 5.3 to 6.1; 0.1.3, PHP012-3: 0.1.2 used such a client as given, and
+ * it followed with the key and reported the other host's reply as a success). A Symfony client no
+ * copy can be made of (older than 5.3) is refused with \InvalidArgumentException when the transport
+ * is made: a leaked key is worse than a startup error. The public rates go through the client as
+ * given. Guzzle's sendRequest() never follows (its PSR-18 path forces `allow_redirects` off). Any
+ * other client must be built not to follow: check yours.
  *
  * One thing the adapter cannot do for you (checked against Guzzle 7 and Symfony HttpClient 7):
  *  - the deadline: PSR-18 has no per-request timeout, so Request::$timeoutMs is not passed on.
@@ -59,16 +64,57 @@ final class Psr18Transport implements TransportInterface
 
     /**
      * `$client` for requests that carry the key: for Symfony's PSR-18 clients a copy that follows no redirect, made
-     * by their withOptions() (Symfony 6.2 and later); any other client as it is.
+     * by their withOptions() (Symfony 6.2 and later) or through the client they wrap (5.3 to 6.1), and an
+     * \InvalidArgumentException when neither can be made; any other client as it is.
      */
     private static function withoutRedirects(ClientInterface $client): ClientInterface
     {
         // By name: both classes are final, and Symfony is no dependency of this package.
-        if (in_array($client::class, self::SYMFONY_CLIENTS, true) && method_exists($client, 'withOptions')) {
-            $copy = $client->withOptions(['max_redirects' => 0]);
-            return $copy instanceof ClientInterface ? $copy : $client;
+        if (!in_array($client::class, self::SYMFONY_CLIENTS, true)) {
+            return $client;
         }
-        return $client;
+        $copy = method_exists($client, 'withOptions')
+            ? $client->withOptions(['max_redirects' => 0])
+            : self::olderSymfonyWithoutRedirects($client);
+        if (!$copy instanceof ClientInterface) {
+            throw new \InvalidArgumentException(sprintf(
+                'Psr18Transport: this %s cannot be stopped from following redirects, which would send X-API-Key to'
+                . ' the host a redirect names: use symfony/http-client 5.3 or later, or leave the transport out (the'
+                . ' default CurlTransport never follows one)',
+                $client::class,
+            ));
+        }
+        return $copy;
+    }
+
+    /**
+     * Before 6.2, Symfony's PSR-18 clients have no withOptions(), but the HttpClientInterface each wraps in its
+     * private `client` property has had one since 5.3: a clone of the client with that property set to the wrapped
+     * client's non-following copy, its other options kept and the caller's client untouched. Null when the client is
+     * not shaped so (Symfony older than 5.3, or a shape this does not know), and the caller refuses it. Those
+     * versions are frozen; if the shape ever changes, the result is that refusal, never a leak.
+     */
+    private static function olderSymfonyWithoutRedirects(ClientInterface $client): ?ClientInterface
+    {
+        $reflection = new \ReflectionObject($client);
+        if (!$reflection->hasProperty('client')) {
+            return null;
+        }
+        $property = $reflection->getProperty('client');
+        if ($property->isStatic() || $property->isReadOnly()) {
+            return null;
+        }
+        $wrapped = $property->getValue($client);
+        if (!is_object($wrapped) || !method_exists($wrapped, 'withOptions')) {
+            return null;
+        }
+        $nonFollowing = $wrapped->withOptions(['max_redirects' => 0]);
+        if (!is_object($nonFollowing) || $nonFollowing::class !== $wrapped::class) {
+            return null;
+        }
+        $copy = clone $client;
+        $property->setValue($copy, $nonFollowing);
+        return $copy;
     }
 
     public function send(#[\SensitiveParameter] Request $request): Response

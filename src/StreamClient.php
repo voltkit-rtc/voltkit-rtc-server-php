@@ -7,6 +7,7 @@ namespace VoltKit\Rtc;
 use Psr\Log\LoggerInterface;
 use VoltKit\Rtc\Internal\ApiKey;
 use VoltKit\Rtc\Internal\Redactor;
+use VoltKit\Rtc\Internal\ReplyJson;
 use VoltKit\Rtc\Internal\Secrets;
 use VoltKit\Rtc\Transport\CurlTransport;
 use VoltKit\Rtc\Transport\Request;
@@ -51,7 +52,7 @@ use VoltKit\Rtc\Transport\TransportInterface;
 final class StreamClient implements \JsonSerializable, \Stringable
 {
     /** The package version; also the version in the User-Agent. Bump with CHANGELOG.md. */
-    public const VERSION = '0.1.2';
+    public const VERSION = '0.1.3';
     /** Sent on every request, to the controller and to the rates host: nothing more identifying (spec 8). */
     public const USER_AGENT = 'voltkit-rtc-php/' . self::VERSION;
 
@@ -909,11 +910,12 @@ final class StreamClient implements \JsonSerializable, \Stringable
                     return ['value' => null, 'error' => ["http-$status", $message, false]];
                 }
             }
-            $value = $text === '' ? null : json_decode($text, true, 512, JSON_THROW_ON_ERROR);
+            $value = $text === '' ? null : ReplyJson::decode($text, true);
             return ['value' => $value, 'error' => null];
         } catch (\JsonException) {
             // A success that is not JSON came from something other than the API, a web page or a proxy, and a retry
-            // would fetch the same thing.
+            // would fetch the same thing. What the API does send and PHP alone refused, a lone surrogate escape or
+            // nesting past 512 levels in a viewer's message or metadata, is read by ReplyJson (PHP012-1, 0.1.3).
             $message = "$method $path: the reply is not JSON: ";
             $message .= self::cut($this->secrets->redact($text), self::CUT_NOT_JSON);
             return ['value' => null, 'error' => ["http-$status", $message, false]];
@@ -935,7 +937,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
      */
     private static function shapeProblem(#[\SensitiveParameter] string $text, array $shape): ?string
     {
-        $value = json_decode(str_replace('"\\u0000', '"\\u0001', $text), false, 512, JSON_THROW_ON_ERROR);
+        $value = ReplyJson::decode(str_replace('"\\u0000', '"\\u0001', $text), false);
         if (!$value instanceof \stdClass) {
             return self::NOT_AN_OBJECT;
         }
@@ -966,7 +968,7 @@ final class StreamClient implements \JsonSerializable, \Stringable
     private static function errorFields(#[\SensitiveParameter] string $text): array
     {
         try {
-            $body = json_decode($text, true, 512, JSON_THROW_ON_ERROR);
+            $body = ReplyJson::decode($text, true);
         } catch (\JsonException) {
             return [null, null];
         }

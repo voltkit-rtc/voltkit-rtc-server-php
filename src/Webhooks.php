@@ -84,7 +84,8 @@ final class Webhooks
      * @param array{toleranceSeconds?: int|float|null, now?: int|float|\Closure|null} $options as for verify()
      * @return array{id: string, type: string, tenantId: string, roomId?: string, createdAt: int, data?: array<string, mixed>, ...}
      * @throws StreamError bad-signature, 401, when the signature or the timestamp does not verify
-     * @throws \JsonException when the verified body is not JSON (never from VoltKit)
+     * @throws \JsonException when the verified body is text PHP cannot read (never from VoltKit: a lone surrogate escape
+     *                        reads as U+FFFD and nesting up to about 5,000 levels reads, as in Node and Go; 0.1.3)
      * @throws \UnexpectedValueException when the verified body is JSON but not an object
      */
     public static function parse(
@@ -96,7 +97,7 @@ final class Webhooks
         if (!self::verify($rawBody, $header, $secrets, $options)) {
             throw new StreamError('bad-signature', 401, 'webhook signature did not verify', false);
         }
-        $event = json_decode($rawBody, true, 512, JSON_THROW_ON_ERROR);
+        $event = Internal\ReplyJson::decode($rawBody, true);
         // An object is told from a list by the JSON itself: decoded, {} and [] are the same empty array and {"0":1}
         // is a list (PHP011-4). JSON that decoded is an object exactly when it starts with {, after JSON's whitespace.
         if (!is_array($event) || ltrim($rawBody, " \t\n\r")[0] !== '{') {

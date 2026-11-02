@@ -4,6 +4,46 @@ All notable changes to `voltkit/rtc-server` are listed here. The package follows
 0.x, a minor bump may add API, and nothing public is removed or renamed without a deprecation
 release first.
 
+## 0.1.3 (2026-11-02)
+
+From the testers' report of 2026-11-01 (PHP012-1 to PHP012-3) and the lead's decision D13 of that round. Each fix
+has a test that failed on 0.1.2.
+
+- **A reply, or a verified webhook body, that PHP alone refused now reads as Node and Go read it** (PHP012-1, D13).
+  A token holder with the viewer role could send one chat message holding a lone UTF-16 surrogate escape (`"\ud83d"`)
+  or nested 509 levels or more, and `listMessages` for that channel then failed with `http-200` `the reply is not
+  JSON`, not retried, whenever the page held that message; a viewer's own `setMetadata` at depth 509 to 999 did the
+  same to `getRoom` and `listParticipants`; and with the `chat.message` webhook a correctly signed delivery made
+  `Webhooks::parse` throw a raw `\JsonException` past the example receiver's `catch (StreamError)`, so it answered a
+  real delivery with a fatal and a 500, which VoltKit retries for about 40 minutes. The four `json_decode` sites now
+  read through one `ReplyJson::decode`: a depth of 5,000 (PHP's own parser gives up a little before it, at about 4,998
+  levels of `[` and 2,500 of `{"a":`, whatever depth is asked, with a clean "not JSON" and no crash; 4 KB of metadata
+  holds at most 2,048 levels), and a rewrite of each lone surrogate escape to U+FFFD that runs only after PHP has
+  refused the text for exactly that reason (`JSON_ERROR_UTF16`), so valid text is never changed and costs nothing more,
+  and a key with a lone surrogate becomes a key ending in U+FFFD, never another key (`{"token\ud83d":"evil"}` is not
+  `token`). The webhook signature is still checked on the raw bytes: the same event written with U+FFFD itself does
+  not verify. Behaviour change: a 2xx holding such text was a `StreamError` `http-<status>` and is the data now;
+  `Webhooks::parse` still throws `\JsonException`, only for text PHP truly cannot read (deeper than its parser allows,
+  bytes that are not UTF-8, cut short), which no VoltKit delivery is, so the examples' `catch (StreamError)` is enough
+  for every real delivery. `RedteamTest` had pinned both cases as "not JSON", on the view that only something other
+  than the API could send them; a client can.
+- **`Psr18Transport` on Symfony older than 6.2** (PHP012-3, D13). Symfony's `Psr18Client` and `HttplugClient` had
+  no `withOptions()` before 6.2, and 0.1.2 then used the client as given: it followed a redirect with `X-API-Key` and
+  returned the other host's reply as a success, with no error (Symfony 5.4 installs with a default Composer). A
+  request carrying the key now goes through a clone of the client whose wrapped `HttpClientInterface` (its private
+  `client`, which has had `withOptions()` since Symfony 5.3) is that client's non-following copy, the caller's client
+  and its other options untouched; a client no copy can be made of (Symfony older than 5.3, or a shape this does not
+  know) is refused with `\InvalidArgumentException` when the transport is made, naming the class and the fix: a leaked
+  key is worse than a startup error. Behaviour change: on Symfony 4.4 to 5.2 the transport's constructor throws where
+  it used to leak, and a `withOptions()` on 6.2 and later that returns something odd throws too, where it fell back to
+  the leaking client. `getRates()` still goes through the client as given. Tested with stand-ins shaped like Symfony
+  5.4's classes under their names: the installed Symfony is 7.4 and no older one is available here; the testers ran
+  the real 5.3.14 to 7.4.22 with this design.
+- **The suite runs with assertions on** (PHP012-2, a test bug). `VectorsTest::webhooks` asserted `toleranceSeconds`
+  to be a number, and 20 `wholeSeconds` vectors have it `null`: with `zend.assertions=1` (PHP's default without a
+  `php.ini`, as in `php:8.x-cli`) the test failed and the rest of it never ran. It accepts `null`, and `make
+  sdk-check-php` runs `php -d zend.assertions=1 vendor/bin/phpunit` from now on. Nothing in the SDK changed for this.
+
 ## 0.1.2 (2026-10-31)
 
 From the testers' report of 2026-10-31 (PHP011-1 to PHP011-4, X-1, X-3) and the

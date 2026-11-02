@@ -8,3 +8,6 @@ parameters:
         - phpstan-stubs/laravel.stub
         - phpstan-stubs/curl.stub
     treatPhpDocTypesAsCertain: false
+    excludePaths:
+        # Stand-ins declared under Symfony's own class names, loaded in a process of their own (Psr18SymfonyBefore62Test).
+        - tests/Support/SymfonyBefore62
