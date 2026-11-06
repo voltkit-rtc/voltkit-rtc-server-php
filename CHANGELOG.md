@@ -4,6 +4,11 @@ All notable changes to `voltkit/rtc-server` are listed here. The package follows
 0.x, a minor bump may add API, and nothing public is removed or renamed without a deprecation
 release first.
 
+## 0.1.4 (2026-11-05)
+
+No code changed. This release replaces 0.1.3's package text, whose README read as unreleased (VK1031-11). The shared vectors
+now come from `@voltkit-rtc/server` 0.4.12.
+
 ## 0.1.3 (2026-11-02)
 
 From the testers' report of 2026-11-01 (PHP012-1 to PHP012-3) and the lead's decision D13 of that round. Each fix

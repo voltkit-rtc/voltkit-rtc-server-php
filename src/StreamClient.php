@@ -52,7 +52,7 @@ use VoltKit\Rtc\Transport\TransportInterface;
 final class StreamClient implements \JsonSerializable, \Stringable
 {
     /** The package version; also the version in the User-Agent. Bump with CHANGELOG.md. */
-    public const VERSION = '0.1.3';
+    public const VERSION = '0.1.4';
     /** Sent on every request, to the controller and to the rates host: nothing more identifying (spec 8). */
     public const USER_AGENT = 'voltkit-rtc-php/' . self::VERSION;
 

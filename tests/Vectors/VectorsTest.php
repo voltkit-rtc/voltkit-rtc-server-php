@@ -139,7 +139,7 @@ final class VectorsTest extends TestCase
         self::assertSame($c['ratesPath'], StreamClient::RATES_PATH);
         $wh = self::arr($c['webhookHeader'], 'webhookHeader');
         self::assertSame($wh['maxHeaderLength'], Webhooks::MAX_HEADER_LENGTH);
-        self::assertSame('0.4.11', $c['nodeSdkVersion'], 'the vectors were regenerated from another Node SDK: review the changes');
+        self::assertSame('0.4.12', $c['nodeSdkVersion'], 'the vectors were regenerated from another Node SDK: review the changes');
         // The words of a 2xx that is not what the call needs (spec 3.6), as this SDK writes them.
         $shape = self::arr($c['replyShape'], 'replyShape');
         assert(is_string($shape['messagePrefix']) && is_string($shape['notAnObject']));
